@@ -56,7 +56,7 @@ from m5.SimObject import *
 class BaseO3CPU(BaseCPU):
     type = "BaseO3CPU"
     cxx_class = "gem5::o3::CPU"
-    cxx_header = "cpu/o3/dyn_inst.hh"
+    cxx_header = "cpu/o3/cpu.hh"
 
     @classmethod
     def memory_mode(cls):
@@ -185,6 +185,9 @@ class BaseO3CPU(BaseCPU):
     # most ISAs don't use condition-code regs, so default is 0
     numPhysCCRegs = Param.Unsigned(0, "Number of physical cc registers")
     instQueues = VectorParam.IQUnit(IQUnit(), "Vector of IQs")
+    iqInsertionPolicy = Param.IQInsertionPolicy(
+        "FirstMatch", "Policy for inserting instructions to IQs"
+    )
     numROBEntries = Param.Unsigned(192, "Number of reorder buffer entries")
 
     smtNumFetchingThreads = Param.Unsigned(1, "SMT Number of Fetching Threads")
@@ -239,6 +242,21 @@ class BaseO3CPU(BaseCPU):
     maxTakenPredPerCycle = Param.Unsigned(
         1, "Max number of taken predictions per cycle"
     )
+
+    ## Parameters for Micro-op Cache (HPCA 2025: FLACK & FURBYS)
+    enableUopCache = Param.Bool(False, "Enable micro-op cache in the frontend")
+    uopCacheEntries = Param.Unsigned(512, "Total entries in micro-op cache")
+    uopCacheAssoc = Param.Unsigned(8, "Micro-op cache associativity (ways)")
+    uopCacheUopsPerEntry = Param.Unsigned(8, "Maximum micro-ops stored per cache entry")
+    uopCacheReplPolicy = Param.String("lru", "Replacement policy: lru, srrip, belady, flack, furbys")
+    uopCacheSwitchDelay = Param.Cycles(1, "Cycles penalty when switching to legacy decode path on uop cache miss")
+    uopCacheDecodeDelay = Param.Cycles(5, "Decoder pipeline latency before PW insertion into uop cache")
+    uopCacheInclusive = Param.Bool(True, "Whether uop cache is strictly inclusive of L1 icache")
+    uopCacheFurbysWeightFile = Param.String("", "Path to offline-profiled weights file for FURBYS")
+    uopCacheFurbysBypassThreshold = Param.Int(1, "Threshold K for FURBYS selective bypass (bypass if weight < min_weight - K)")
+    uopCachePitfallDepth = Param.Unsigned(2, "Depth of local miss-pitfall detector in FURBYS")
+    uopCacheTraceFile = Param.String("", "Path to future access trace file for Belady or FLACK offline replay")
+    uopCacheProfileOutputFile = Param.String("", "Output file path to dump PW access trace for offline profiling")
 
 
 add_citation(

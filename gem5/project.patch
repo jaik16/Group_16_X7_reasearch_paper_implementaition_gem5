@@ -1,0 +1,1967 @@
+diff --git a/configs/example/uop_cache_run.py b/configs/example/uop_cache_run.py
+new file mode 100755
+index 0000000000..24ed72bfd9
+--- /dev/null
++++ b/configs/example/uop_cache_run.py
+@@ -0,0 +1,181 @@
++# Copyright (c) 2026 Group 16 (Kabir Gupta, Jayesh Vijaivargia, Mahendra)
++# All rights reserved.
++#
++# gem5 Simulation Script for Evaluating Micro-op Cache Replacement Policies
++# Based on HPCA 2025 paper:
++# "From Optimal to Practical: Efficient Micro-op Cache Replacement Policies
++#  for Data Center Applications" by Kan Zhu et al.
++#
++# Configures an AMD Zen3-like x86 O3CPU frontend as specified in Table I:
++#  - Micro-op Cache: 512 entries, 8-way (64 sets), 8 uops/entry
++#  - 1-cycle switch delay
++#  - Strict inclusiveness with L1 instruction cache
++#  - Replacement policies: LRU, SRRIP, BELADY, FLACK, FURBYS
++
++import argparse
++import sys
++import os
++
++import m5
++from m5.objects import *
++
++parser = argparse.ArgumentParser(description="Evaluate Micro-op Cache in gem5 O3CPU")
++
++# Simulation Binary
++parser.add_argument("--cmd", type=str,
++                    default="tests/test-progs/hello/bin/x86/linux/hello",
++                    help="Path to executable binary (default: built-in hello)")
++parser.add_argument("--options", type=str, default="",
++                    help="Command-line arguments for the binary")
++
++# Micro-op Cache Configuration (Table I from paper)
++parser.add_argument("--enable-uop-cache", action="store_true", default=True,
++                    help="Enable the micro-op cache")
++parser.add_argument("--disable-uop-cache", dest="enable_uop_cache", action="store_false",
++                    help="Disable micro-op cache (baseline without uop cache)")
++parser.add_argument("--uop-entries", type=int, default=512,
++                    help="Total entries in micro-op cache (default: 512)")
++parser.add_argument("--uop-assoc", type=int, default=8,
++                    help="Associativity of micro-op cache (default: 8)")
++parser.add_argument("--uop-uops-per-entry", type=int, default=8,
++                    help="Micro-ops per entry (default: 8)")
++parser.add_argument("--repl-policy", type=str, default="lru",
++                    choices=["lru", "srrip", "belady", "flack", "furbys"],
++                    help="Replacement policy: lru, srrip, belady, flack, furbys")
++parser.add_argument("--uop-switch-delay", type=int, default=1,
++                    help="Switch penalty delay cycles on uop cache miss (default: 1)")
++parser.add_argument("--uop-decode-delay", type=int, default=5,
++                    help="Decoder pipeline latency cycles before PW insertion (default: 5)")
++parser.add_argument("--furbys-weight-file", type=str, default="",
++                    help="Path to offline-profiled weights file for FURBYS")
++parser.add_argument("--uop-trace-file", type=str, default="",
++                    help="Path to future access trace file for Belady or FLACK replay")
++parser.add_argument("--furbys-k", type=int, default=1,
++                    help="Selective bypass threshold K for FURBYS (default: 1)")
++parser.add_argument("--pitfall-depth", type=int, default=2,
++                    help="Depth of local miss-pitfall detector (default: 2)")
++parser.add_argument("--dump-trace", type=str, default="",
++                    help="File path to dump PW access trace for offline profiling")
++
++args = parser.parse_args()
++
++# Build System
++system = System()
++system.clk_domain = SrcClockDomain()
++system.clk_domain.clock = "3.2GHz"  # Table I: 3.2GHz
++system.clk_domain.voltage_domain = VoltageDomain()
++
++system.mem_mode = "timing"
++system.mem_ranges = [AddrRange("8GiB")]  # Table I: 8-GiB DRAM
++
++# Configure CPU with Zen3-like parameters
++cpu = X86O3CPU()
++cpu.fetchWidth = 8
++cpu.decodeWidth = 4      # Table I: 4-wide decoder
++cpu.renameWidth = 6      # Table I: 6-wide OoO
++cpu.dispatchWidth = 6
++cpu.issueWidth = 6
++cpu.numROBEntries = 256  # Table I: 256-entry ROB
++cpu.numIQEntries = 96    # Table I: 96-entry RS
++cpu.decoupledFrontEnd = False
++
++# Micro-op Cache Parameters
++cpu.enableUopCache = args.enable_uop_cache
++cpu.uopCacheEntries = args.uop_entries
++cpu.uopCacheAssoc = args.uop_assoc
++cpu.uopCacheUopsPerEntry = args.uop_uops_per_entry
++cpu.uopCacheReplPolicy = args.repl_policy
++cpu.uopCacheSwitchDelay = args.uop_switch_delay
++cpu.uopCacheDecodeDelay = args.uop_decode_delay
++cpu.uopCacheInclusive = True
++cpu.uopCacheFurbysWeightFile = args.furbys_weight_file
++cpu.uopCacheTraceFile = args.uop_trace_file
++cpu.uopCacheFurbysBypassThreshold = args.furbys_k
++cpu.uopCachePitfallDepth = args.pitfall_depth
++cpu.uopCacheProfileOutputFile = args.dump_trace
++
++system.cpu = [cpu]
++
++# Caches (Table I: L1i 32KB 8-way 1-cycle, L1d 32KB 8-way 2-cycle, L2 512KB 8-way 16-cycle)
++class L1ICache(Cache):
++    size = "32KiB"
++    assoc = 8
++    tag_latency = 1
++    data_latency = 1
++    response_latency = 1
++    mshrs = 4
++    tgts_per_mshr = 20
++
++class L1DCache(Cache):
++    size = "32KiB"
++    assoc = 8
++    tag_latency = 2
++    data_latency = 2
++    response_latency = 2
++    mshrs = 4
++    tgts_per_mshr = 20
++
++class L2Cache(Cache):
++    size = "512KiB"
++    assoc = 8
++    tag_latency = 16
++    data_latency = 16
++    response_latency = 16
++    mshrs = 20
++    tgts_per_mshr = 12
++
++system.cpu[0].icache = L1ICache()
++system.cpu[0].dcache = L1DCache()
++system.l2bus = L2XBar()
++system.l2cache = L2Cache()
++
++system.cpu[0].icache.cpu_side = system.cpu[0].icache_port
++system.cpu[0].dcache.cpu_side = system.cpu[0].dcache_port
++system.cpu[0].icache.mem_side = system.l2bus.cpu_side_ports
++system.cpu[0].dcache.mem_side = system.l2bus.cpu_side_ports
++system.l2cache.cpu_side = system.l2bus.mem_side_ports
++
++system.membus = SystemXBar()
++system.l2cache.mem_side = system.membus.cpu_side_ports
++
++# Memory Controller
++system.mem_ctrl = MemCtrl()
++system.mem_ctrl.dram = DDR4_2400_16x4()
++system.mem_ctrl.dram.range = system.mem_ranges[0]
++system.mem_ctrl.port = system.membus.mem_side_ports
++
++system.system_port = system.membus.cpu_side_ports
++
++# Interrupt Controller for x86
++system.cpu[0].createInterruptController()
++system.cpu[0].interrupts[0].pio = system.membus.mem_side_ports
++system.cpu[0].interrupts[0].int_requestor = system.membus.cpu_side_ports
++system.cpu[0].interrupts[0].int_responder = system.membus.mem_side_ports
++
++# Set up process
++process = Process()
++process.executable = args.cmd
++process.cmd = [args.cmd] + args.options.split()
++system.cpu[0].workload = process
++system.cpu[0].createThreads()
++
++system.workload = SEWorkload.init_compatible(args.cmd)
++
++root = Root(full_system=False, system=system)
++m5.instantiate()
++
++print("=" * 60)
++print("gem5 Micro-op Cache Simulation Starting")
++print(f"  Binary:      {args.cmd}")
++print(f"  Uop Cache:   {'Enabled' if args.enable_uop_cache else 'Disabled'}")
++if args.enable_uop_cache:
++    print(f"  Entries:     {args.uop_entries} ({args.uop_assoc}-way)")
++    print(f"  Policy:      {args.repl_policy.upper()}")
++    if args.repl_policy == 'furbys':
++        print(f"  FURBYS File: {args.furbys_weight_file or 'None (using defaults)'}")
++        print(f"  Bypass K:    {args.furbys_k}")
++        print(f"  Pitfall D:   {args.pitfall_depth}")
++print("=" * 60)
++
++exit_event = m5.simulate()
++print(f"Simulation finished at tick {m5.curTick()} because: {exit_event.getCause()}")
+diff --git a/src/cpu/o3/BaseO3CPU.py b/src/cpu/o3/BaseO3CPU.py
+index 4759ad2f0a..bd5a0cc1d9 100644
+--- a/src/cpu/o3/BaseO3CPU.py
++++ b/src/cpu/o3/BaseO3CPU.py
+@@ -243,6 +243,21 @@ class BaseO3CPU(BaseCPU):
+         1, "Max number of taken predictions per cycle"
+     )
+ 
++    ## Parameters for Micro-op Cache (HPCA 2025: FLACK & FURBYS)
++    enableUopCache = Param.Bool(False, "Enable micro-op cache in the frontend")
++    uopCacheEntries = Param.Unsigned(512, "Total entries in micro-op cache")
++    uopCacheAssoc = Param.Unsigned(8, "Micro-op cache associativity (ways)")
++    uopCacheUopsPerEntry = Param.Unsigned(8, "Maximum micro-ops stored per cache entry")
++    uopCacheReplPolicy = Param.String("lru", "Replacement policy: lru, srrip, belady, flack, furbys")
++    uopCacheSwitchDelay = Param.Cycles(1, "Cycles penalty when switching to legacy decode path on uop cache miss")
++    uopCacheDecodeDelay = Param.Cycles(5, "Decoder pipeline latency before PW insertion into uop cache")
++    uopCacheInclusive = Param.Bool(True, "Whether uop cache is strictly inclusive of L1 icache")
++    uopCacheFurbysWeightFile = Param.String("", "Path to offline-profiled weights file for FURBYS")
++    uopCacheFurbysBypassThreshold = Param.Int(1, "Threshold K for FURBYS selective bypass (bypass if weight < min_weight - K)")
++    uopCachePitfallDepth = Param.Unsigned(2, "Depth of local miss-pitfall detector in FURBYS")
++    uopCacheTraceFile = Param.String("", "Path to future access trace file for Belady or FLACK offline replay")
++    uopCacheProfileOutputFile = Param.String("", "Output file path to dump PW access trace for offline profiling")
++
+ 
+ add_citation(
+     BaseO3CPU,
+diff --git a/src/cpu/o3/SConscript b/src/cpu/o3/SConscript
+index baaaeb5196..9884262b5b 100755
+--- a/src/cpu/o3/SConscript
++++ b/src/cpu/o3/SConscript
+@@ -73,6 +73,7 @@ if env['CONF']['BUILD_ISA']:
+     Source('store_set.cc')
+     Source('thread_context.cc')
+     Source('thread_state.cc')
++    Source('uop_cache.cc')
+ 
+     DebugFlag('BAC')
+     DebugFlag('CommitRate')
+@@ -88,11 +89,12 @@ if env['CONF']['BUILD_ISA']:
+     DebugFlag('Scoreboard')
+     DebugFlag('StoreSet')
+     DebugFlag('Writeback')
++    DebugFlag('UopCache')
+ 
+     CompoundFlag('O3CPUAll', [ 'BAC', 'FTQ', 'Fetch', 'Decode', 'Rename',
+         'IEW', 'Commit',
+         'IQ', 'ROB', 'FreeList', 'LSQ', 'LSQUnit', 'StoreSet', 'MemDepUnit',
+-        'DynInst', 'O3CPU', 'Activity', 'Scoreboard', 'Writeback' ])
++        'DynInst', 'O3CPU', 'Activity', 'Scoreboard', 'Writeback', 'UopCache' ])
+ 
+     SimObject('BaseO3Checker.py', sim_objects=['BaseO3Checker'])
+     Source('checker.cc')
+diff --git a/src/cpu/o3/fetch.cc b/src/cpu/o3/fetch.cc
+index 943fd6d39a..f07f597b85 100644
+--- a/src/cpu/o3/fetch.cc
++++ b/src/cpu/o3/fetch.cc
+@@ -60,6 +60,7 @@
+ #include "debug/Drain.hh"
+ #include "debug/Fetch.hh"
+ #include "debug/O3CPU.hh"
++#include "debug/UopCache.hh"
+ #include "mem/packet.hh"
+ #include "params/BaseO3CPU.hh"
+ #include "sim/byteswap.hh"
+@@ -136,6 +137,7 @@ Fetch::Fetch(CPU *_cpu, const BaseO3CPUParams &params)
+       finishTranslationEvent(this),
+       maxFTPerCycle(params.maxFTPerCycle),
+       maxTakenPredPerCycle(params.maxTakenPredPerCycle),
++      uopCache(std::make_unique<UopCache>(_cpu, params)),
+       fetchStats(_cpu, this)
+ {
+     if (numThreads > MaxThreads)
+@@ -170,6 +172,14 @@ Fetch::Fetch(CPU *_cpu, const BaseO3CPUParams &params)
+         fetchBufferValid[i] = false;
+         lastIcacheStall[i] = 0;
+         issuePipelinedIfetch[i] = false;
++        uopCacheServing[i] = false;
++        inUopCacheMode[i] = false;
++        atPWBoundary[i] = true;
++        activeUops[i].clear();
++        activeUopIdx[i] = 0;
++        uopCacheStallCycles[i] = Cycles(0);
++        fetchBufferPAddr[i] = 0;
++        accumulationBuffer[i] = AccumulationBuffer(params.uopCacheUopsPerEntry);
+     }
+ 
+     for (ThreadID tid = 0; tid < numThreads; tid++) {
+@@ -612,6 +622,7 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
+         data_pkt->dataDynamic(new uint8_t[fetchBufferSize]);
+ 
+         fetchBufferPC[tid] = fetchBufferBlockPC;
++        fetchBufferPAddr[tid] = mem_req->getPaddr() & ~Addr(cacheBlkSize - 1);
+         fetchBufferValid[tid] = false;
+         DPRINTF(Fetch, "Fetch: Doing instruction read.\n");
+ 
+@@ -722,6 +733,15 @@ Fetch::doSquash(const PCStateBase &new_pc, const DynInstPtr squashInst,
+         macroop[tid] = NULL;
+     decoder[tid]->reset();
+ 
++    // Reset uop cache transient state on squash
++    uopCacheServing[tid] = false;
++    inUopCacheMode[tid] = false;
++    atPWBoundary[tid] = true;
++    activeUops[tid].clear();
++    activeUopIdx[tid] = 0;
++    accumulationBuffer[tid].reset();
++    uopCacheStallCycles[tid] = Cycles(0);
++
+     // Clear the icache miss if it's outstanding.
+     if (fetchStatus[tid] == IcacheWaitResponse) {
+         DPRINTF(Fetch, "[tid:%i] Squashing outstanding Icache miss.\n",
+@@ -820,6 +840,10 @@ Fetch::updateFetchStatus()
+ void
+ Fetch::tick()
+ {
++    if (uopCache) {
++        uopCache->tick();
++    }
++
+     bool status_change = false;
+ 
+     wroteToTimeBuffer = false;
+@@ -1117,13 +1141,44 @@ Fetch::fetch(bool &status_change)
+         fetchStatus[tid] = Running;
+         status_change = true;
+     } else if (fetchStatus[tid] == Running) {
++        if (uopCacheStallCycles[tid] > Cycles(0)) {
++            --uopCacheStallCycles[tid];
++            return;
++        }
++
++        if (uopCache && uopCache->isEnabled() && !inRom && !macroop[tid]) {
++            if (!uopCacheServing[tid] && atPWBoundary[tid]) {
++                bool partialHit = false;
++                std::vector<CachedUop> uops;
++                if (uopCache->lookup(this_pc.instAddr(), uops, partialHit)) {
++                    uopCacheServing[tid] = true;
++                    inUopCacheMode[tid] = true;
++                    activeUops[tid] = std::move(uops);
++                    activeUopIdx[tid] = 0;
++                    atPWBoundary[tid] = false;
++                    decoder[tid]->reset();
++                } else {
++                    // Miss at PW boundary: charge 1-cycle penalty switch delay ONLY if
++                    // transitioning from uop-cache mode back to legacy pipeline!
++                    if (inUopCacheMode[tid]) {
++                        inUopCacheMode[tid] = false;
++                        if (uopCache->getSwitchDelay() > Cycles(0)) {
++                            uopCacheStallCycles[tid] = uopCache->getSwitchDelay();
++                        }
++                    }
++                    atPWBoundary[tid] = false;
++                }
++            }
++        }
++
+         // Align the fetch PC so its at the start of a fetch buffer segment.
+         Addr fetchBufferBlockPC = fetchBufferAlignPC(fetchAddr);
+ 
+         // If buffer is no longer valid or fetchAddr has moved to point
+         // to the next cache block, AND we have no remaining ucode
+         // from a macro-op, then start fetch from icache.
+-        if (!(fetchBufferValid[tid] && ftqReady(tid, status_change) &&
++        if (!uopCacheServing[tid] &&
++            !(fetchBufferValid[tid] && ftqReady(tid, status_change) &&
+               fetchBufferBlockPC == fetchBufferPC[tid]) &&
+             !inRom && !macroop[tid]) {
+             DPRINTF(Fetch, "[tid:%i] Attempting to translate and read "
+@@ -1196,6 +1251,69 @@ Fetch::fetch(bool &status_change)
+     while (numInst < fetchWidth && fetchQueue[tid].size() < fetchQueueSize
+            && !predictedBranch && !quiesce) {
+ 
++        if (uopCacheServing[tid]) {
++            while (activeUopIdx[tid] < activeUops[tid].size() &&
++                   numInst < fetchWidth &&
++                   fetchQueue[tid].size() < fetchQueueSize &&
++                   !predictedBranch && !quiesce) {
++                auto &uop = activeUops[tid][activeUopIdx[tid]];
++
++                if (uop.pc) {
++                    set(this_pc, *uop.pc);
++                }
++                if (uop.nextPC) {
++                    set(next_pc, *uop.nextPC);
++                } else {
++                    set(next_pc, this_pc);
++                }
++
++                DynInstPtr instruction = buildInst(
++                    tid, uop.staticInst, uop.macroop, this_pc, *next_pc, true);
++                ppFetch->notify(instruction);
++                numInst++;
++                uopCache->incUopHits(1);
++                instruction->fetchTick = curTick();
++
++                predictedBranch |= this_pc.branching();
++                predictedBranch |= bac->updatePC(instruction, *next_pc, curFT);
++                if (instruction->isControl()) {
++                    cpu->fetchStats[tid]->numBranches++;
++                }
++                if (predictedBranch) {
++                    DPRINTF(UopCache, "Branch detected in UopCache: PC=%s -> targ:%s\n",
++                            this_pc, *next_pc);
++                    ++fetchStats.predictedBranches;
++                }
++                set(this_pc, *next_pc);
++                activeUopIdx[tid]++;
++
++                if (instruction->isQuiesce()) {
++                    DPRINTF(Fetch,
++                            "Quiesce instruction encountered, halting fetch!\n");
++                    fetchStatus[tid] = QuiescePending;
++                    status_change = true;
++                    quiesce = true;
++                    break;
++                }
++
++                if (predictedBranch) {
++                    // Intermediate exit branch reached -> partial hit!
++                    if (activeUopIdx[tid] < activeUops[tid].size()) {
++                        uopCache->incPartialHits(1);
++                    }
++                    break;
++                }
++            }
++
++            if (activeUopIdx[tid] >= activeUops[tid].size() || predictedBranch) {
++                uopCacheServing[tid] = false;
++                activeUops[tid].clear();
++                activeUopIdx[tid] = 0;
++                atPWBoundary[tid] = true; // Finished serving PW: next PC is start of a new PW
++            }
++            break;
++        }
++
+         // For the decoupled front-end also check if the FTQ
+         // and the fetch target are still valid.
+         if (decoupledFrontEnd && (!ftq->isReady(tid) || !curFT)) {
+@@ -1276,6 +1394,12 @@ Fetch::fetch(bool &status_change)
+             DynInstPtr instruction = buildInst(
+                     tid, staticInst, curMacroop, this_pc, *next_pc, true);
+ 
++            if (uopCache && uopCache->isEnabled()) {
++                accumulationBuffer[tid].addUop(staticInst, curMacroop, this_pc, *next_pc,
++                                               inRom, fetchBufferPAddr[tid]);
++                uopCache->incUopMisses(1);
++            }
++
+             ppFetch->notify(instruction);
+             numInst++;
+ 
+@@ -1301,6 +1425,23 @@ Fetch::fetch(bool &status_change)
+ 
+             newMacro |= this_pc.instAddr() != next_pc->instAddr();
+ 
++            // Paper: PW terminates ONLY at predicted-taken branch or cache line boundary
++            bool lineCrossed = (this_pc.instAddr() & ~Addr(cacheBlkSize - 1)) !=
++                               (next_pc->instAddr() & ~Addr(cacheBlkSize - 1));
++            bool pwEnded = predictedBranch || lineCrossed;
++
++            if (uopCache && uopCache->isEnabled() && pwEnded) {
++                if (accumulationBuffer[tid].hasPendingPW()) {
++                    PredictionWindow pw =
++                        accumulationBuffer[tid].finalizeWindow(next_pc->instAddr());
++                    if (!pw.containsRomUops) {
++                        pw.weight = uopCache->getWeightForAddress(pw.startPC);
++                        uopCache->insert(pw);
++                    }
++                }
++                atPWBoundary[tid] = true;
++            }
++
+             // Move to the next instruction, unless we have a branch.
+             set(this_pc, *next_pc);
+             inRom = isRomMicroPC(this_pc.microPC());
+@@ -1358,6 +1499,18 @@ Fetch::fetch(bool &status_change)
+         inRom = isRomMicroPC(this_pc.microPC());
+     }
+ 
++    if (uopCache && uopCache->isEnabled() &&
++        (predictedBranch || blkOffset >= numInsts) &&
++        accumulationBuffer[tid].hasPendingPW()) {
++        PredictionWindow pw =
++            accumulationBuffer[tid].finalizeWindow(this_pc.instAddr());
++        if (!pw.containsRomUops) {
++            pw.weight = uopCache->getWeightForAddress(pw.startPC);
++            uopCache->insert(pw);
++        }
++        atPWBoundary[tid] = true;
++    }
++
+     if (predictedBranch) {
+         DPRINTF(Fetch, "[tid:%i] Done fetching, predicted branch "
+                 "instruction encountered.\n", tid);
+@@ -1672,5 +1825,21 @@ Fetch::IcachePort::recvReqRetry()
+     fetch->recvReqRetry();
+ }
+ 
++void
++Fetch::IcachePort::recvTimingSnoopReq(PacketPtr pkt)
++{
++    if (pkt->isInvalidate()) {
++        fetch->invalidateUopCache(pkt->getAddr());
++    }
++}
++
++void
++Fetch::invalidateUopCache(Addr addr)
++{
++    if (uopCache) {
++        uopCache->invalidateByIcacheAddr(addr, cacheBlkSize);
++    }
++}
++
+ } // namespace o3
+ } // namespace gem5
+diff --git a/src/cpu/o3/fetch.hh b/src/cpu/o3/fetch.hh
+index 6014b29c9e..f067833d7a 100644
+--- a/src/cpu/o3/fetch.hh
++++ b/src/cpu/o3/fetch.hh
+@@ -51,6 +51,7 @@
+ #include "cpu/o3/dyn_inst_ptr.hh"
+ #include "cpu/o3/ftq.hh"
+ #include "cpu/o3/limits.hh"
++#include "cpu/o3/uop_cache.hh"
+ #include "cpu/pc_event.hh"
+ #include "cpu/pred/bpred_unit.hh"
+ #include "cpu/timebuf.hh"
+@@ -103,6 +104,10 @@ class Fetch
+ 
+         /** Handles doing a retry of a failed fetch. */
+         virtual void recvReqRetry();
++
++        /** Invalidation snoop from icache for uop cache inclusiveness */
++        void recvTimingSnoopReq(PacketPtr pkt) override;
++        bool isSnooping() const override { return true; }
+     };
+ 
+     class FetchTranslation : public BaseMMU::Translation
+@@ -271,6 +276,9 @@ class Fetch
+ 
+     /** For priority-based fetch policies, need to keep update priorityList */
+     void deactivateThread(ThreadID tid);
++
++    /** Invalidate entry in micro-op cache due to icache eviction (inclusiveness) */
++    void invalidateUopCache(Addr addr);
+   private:
+     /** Reset this pipeline stage */
+     void resetStage();
+@@ -546,6 +554,17 @@ class Fetch
+     const unsigned maxFTPerCycle;
+     const unsigned maxTakenPredPerCycle;
+ 
++    /** Micro-op Cache and frontend tracking structures */
++    std::unique_ptr<UopCache> uopCache;
++    AccumulationBuffer accumulationBuffer[MaxThreads];
++    bool uopCacheServing[MaxThreads];
++    bool inUopCacheMode[MaxThreads];
++    bool atPWBoundary[MaxThreads];
++    std::vector<CachedUop> activeUops[MaxThreads];
++    size_t activeUopIdx[MaxThreads];
++    Cycles uopCacheStallCycles[MaxThreads];
++    Addr fetchBufferPAddr[MaxThreads];
++
+   protected:
+     struct FetchStatGroup : public statistics::Group
+     {
+diff --git a/src/cpu/o3/uop_cache.cc b/src/cpu/o3/uop_cache.cc
+new file mode 100644
+index 0000000000..ec04229cda
+--- /dev/null
++++ b/src/cpu/o3/uop_cache.cc
+@@ -0,0 +1,722 @@
++/*
++ * Copyright (c) 2026 Group 16 (Kabir Gupta, Jayesh Vijaivargia, Mahendra)
++ * All rights reserved.
++ *
++ * Micro-op Cache Implementation for gem5 O3CPU
++ * Based on the HPCA 2025 paper:
++ * "From Optimal to Practical: Efficient Micro-op Cache Replacement Policies
++ *  for Data Center Applications" by Kan Zhu et al.
++ */
++
++#include "cpu/o3/uop_cache.hh"
++
++#include <algorithm>
++#include <cassert>
++#include <cmath>
++#include <fstream>
++#include <sstream>
++
++#include "base/trace.hh"
++#include "cpu/o3/cpu.hh"
++#include "debug/UopCache.hh"
++#include "params/BaseO3CPU.hh"
++
++namespace gem5
++{
++namespace o3
++{
++
++UopCache::UopCacheStatGroup::UopCacheStatGroup(statistics::Group *parent)
++    : statistics::Group(parent, "uop_cache"),
++      ADD_STAT(lookups, statistics::units::Count::get(),
++               "Total micro-op cache lookups"),
++      ADD_STAT(hits, statistics::units::Count::get(),
++               "Total micro-op cache hits"),
++      ADD_STAT(partialHits, statistics::units::Count::get(),
++               "Total micro-op cache partial hits"),
++      ADD_STAT(misses, statistics::units::Count::get(),
++               "Total micro-op cache misses"),
++      ADD_STAT(uopHits, statistics::units::Count::get(),
++               "Total micro-ops delivered from micro-op cache"),
++      ADD_STAT(uopMisses, statistics::units::Count::get(),
++               "Total micro-ops missed in micro-op cache"),
++      ADD_STAT(insertions, statistics::units::Count::get(),
++               "Total insertions into micro-op cache"),
++      ADD_STAT(evictions, statistics::units::Count::get(),
++               "Total evictions from micro-op cache"),
++      ADD_STAT(bypasses, statistics::units::Count::get(),
++               "Total bypassed insertions"),
++      ADD_STAT(furbysNormalDecisions, statistics::units::Count::get(),
++               "Total FURBYS min-weight victim selections"),
++      ADD_STAT(furbysDegradedDecisions, statistics::units::Count::get(),
++               "Total FURBYS degraded (SRRIP) victim selections due to pitfall"),
++      ADD_STAT(inclusivenessInvalidations, statistics::units::Count::get(),
++               "Total micro-op cache entries invalidated by L1 icache inclusiveness"),
++      ADD_STAT(hitRate, statistics::units::Ratio::get(),
++               "Micro-op cache window hit rate", hits / lookups),
++      ADD_STAT(uopHitRate, statistics::units::Ratio::get(),
++               "Micro-op cache micro-op hit rate",
++               uopHits / (uopHits + uopMisses))
++{
++    lookups.prereq(lookups);
++    hits.prereq(hits);
++    partialHits.prereq(partialHits);
++    misses.prereq(misses);
++    uopHits.prereq(uopHits);
++    uopMisses.prereq(uopMisses);
++    insertions.prereq(insertions);
++    evictions.prereq(evictions);
++    bypasses.prereq(bypasses);
++    furbysNormalDecisions.prereq(furbysNormalDecisions);
++    furbysDegradedDecisions.prereq(furbysDegradedDecisions);
++    inclusivenessInvalidations.prereq(inclusivenessInvalidations);
++}
++
++UopCache::UopCache(CPU *_cpu, const BaseO3CPUParams &params)
++    : cpu(_cpu),
++      enabled(params.enableUopCache),
++      numEntries(params.uopCacheEntries),
++      numWays(params.uopCacheAssoc),
++      uopsPerEntry(params.uopCacheUopsPerEntry),
++      switchDelay(params.uopCacheSwitchDelay),
++      decodeDelay(params.uopCacheDecodeDelay),
++      inclusive(params.uopCacheInclusive),
++      furbysBypassThresholdK(params.uopCacheFurbysBypassThreshold),
++      pitfallDepth(params.uopCachePitfallDepth),
++      accessCounter(0),
++      nextPwId(1),
++      profileOutputFilePath(params.uopCacheProfileOutputFile),
++      stats(_cpu)
++{
++    // Open profile trace output file if specified (needed for size-0 profiling runs)
++    if (!profileOutputFilePath.empty()) {
++        profileOutputStream.open(profileOutputFilePath, std::ios::out | std::ios::trunc);
++    }
++
++    // Support numEntries == 0 to allow paper's size-0 trace-collection run
++    // Keeps cache "enabled" so fetch.cc continues recording LOOKUP & INSERT
++    if (numEntries == 0) {
++        numSets = 0;
++        setMask = 0;
++        setShift = 2;
++        isSetPowerOfTwo = true;
++        DPRINTF(UopCache, "UopCache initialized with size 0 (trace collection mode)\n");
++        return;
++    }
++
++    if (numWays == 0) {
++        numWays = 8;
++    }
++
++    numSets = numEntries / numWays;
++    if (numSets == 0) {
++        numSets = 1;
++    }
++
++    // Set indexing: support both power-of-two (mask) and non-power-of-two (modulo)
++    isSetPowerOfTwo = (numSets & (numSets - 1)) == 0;
++    setMask = isSetPowerOfTwo ? (numSets - 1) : 0;
++    setShift = 2; // 4-byte instruction alignment
++
++    sets.resize(numSets);
++    for (unsigned s = 0; s < numSets; ++s) {
++        sets[s].entries.resize(numWays);
++    }
++
++    std::string pol = params.uopCacheReplPolicy;
++    std::transform(pol.begin(), pol.end(), pol.begin(), ::tolower);
++    if (pol == "srrip") {
++        replPolicy = UopCacheReplPolicy::SRRIP;
++    } else if (pol == "belady") {
++        replPolicy = UopCacheReplPolicy::BELADY;
++    } else if (pol == "flack") {
++        replPolicy = UopCacheReplPolicy::FLACK;
++    } else if (pol == "furbys") {
++        replPolicy = UopCacheReplPolicy::FURBYS;
++    } else {
++        replPolicy = UopCacheReplPolicy::LRU;
++    }
++
++    if (!params.uopCacheFurbysWeightFile.empty()) {
++        loadWeightFile(params.uopCacheFurbysWeightFile);
++    }
++
++    if (!params.uopCacheTraceFile.empty()) {
++        loadTraceFile(params.uopCacheTraceFile);
++    }
++
++    DPRINTF(UopCache, "UopCache initialized: enabled=%d, sets=%d (powerOfTwo=%d), ways=%d, "
++                      "uops/entry=%d, repl=%s, inclusive=%d\n",
++            enabled, numSets, isSetPowerOfTwo, numWays, uopsPerEntry, pol.c_str(), inclusive);
++}
++
++UopCache::~UopCache()
++{
++    if (profileOutputStream.is_open()) {
++        profileOutputStream.close();
++    }
++}
++
++unsigned
++UopCache::getSetIndex(Addr pc) const
++{
++    if (numSets == 0)
++        return 0;
++
++    if (isSetPowerOfTwo) {
++        return (pc >> setShift) & setMask;
++    } else {
++        return (pc >> setShift) % numSets;
++    }
++}
++
++void
++UopCache::recordProfileTrace(const char *eventType, Addr pc, unsigned cost, unsigned size)
++{
++    if (profileOutputStream.is_open()) {
++        profileOutputStream << eventType << " 0x" << std::hex << pc
++                            << std::dec << " " << cost << " " << size << "\n";
++    }
++}
++
++void
++UopCache::tick()
++{
++    if (!enabled)
++        return;
++
++    // Process pending asynchronous insertions after decode latency
++    while (!pendingInsertions.empty() && pendingInsertions.front().readyTick <= curTick()) {
++        PredictionWindow pw = pendingInsertions.front().pw;
++        pendingInsertions.pop_front();
++        doInsert(pw);
++    }
++}
++
++uint64_t
++UopCache::getNextAccess(Addr pc, uint64_t currentAccess)
++{
++    auto it = futureAccessTrace.find(pc);
++    if (it != futureAccessTrace.end()) {
++        auto &q = it->second;
++        // Pop past accesses (less than or equal to current access)
++        while (!q.empty() && q.front() <= currentAccess) {
++            q.pop_front();
++        }
++        if (!q.empty()) {
++            return q.front();
++        }
++    }
++    return UINT64_MAX; // No further access known
++}
++
++bool
++UopCache::lookup(Addr pc, std::vector<CachedUop> &outUops, bool &partialHit)
++{
++    if (!enabled)
++        return false;
++
++    stats.lookups++;
++    accessCounter++;
++    recordProfileTrace("LOOKUP", pc, 0, 0);
++
++    // If cache size is 0 (trace collection mode), always miss after logging lookup
++    if (numSets == 0) {
++        stats.misses++;
++        return false;
++    }
++
++    unsigned setIdx = getSetIndex(pc);
++    auto &set = sets[setIdx];
++
++    partialHit = false;
++
++    for (unsigned w = 0; w < numWays; ++w) {
++        auto &entry = set.entries[w];
++        if (entry.valid && entry.tag == pc) {
++            // Hit in the micro-op cache!
++            stats.hits++;
++            outUops = entry.uops;
++
++            // Update replacement metadata on hit
++            entry.lastTouchTick = curTick();
++            if (replPolicy == UopCacheReplPolicy::SRRIP ||
++                replPolicy == UopCacheReplPolicy::FURBYS) {
++                entry.rrpv = 0; // Hit promotion
++            }
++
++            // Belady future access update (accessCounter was incremented above, so current is accessCounter - 1)
++            entry.nextAccess = getNextAccess(pc, accessCounter - 1);
++
++            DPRINTF(UopCache, "UopCache HIT at PC 0x%lx (set %u, way %u, uops %zu)\n",
++                    pc, setIdx, w, entry.uops.size());
++            return true;
++        }
++    }
++
++    // Miss in micro-op cache
++    stats.misses++;
++    DPRINTF(UopCache, "UopCache MISS at PC 0x%lx (set %u)\n", pc, setIdx);
++    return false;
++}
++
++void
++UopCache::insert(const PredictionWindow &pw)
++{
++    if (!enabled || pw.uops.empty())
++        return;
++
++    // Do not cache windows containing microcode (ROM) operations
++    if (pw.containsRomUops)
++        return;
++
++    if (decodeDelay > Cycles(0)) {
++        // Model asynchronous insertion delay through decode pipeline
++        Tick ready = curTick() + cpu->cyclesToTicks(decodeDelay);
++        pendingInsertions.push_back({pw, ready});
++    } else {
++        doInsert(pw);
++    }
++}
++
++void
++UopCache::doInsert(const PredictionWindow &pw)
++{
++    // Record insertion in profile output stream if tracing (runs even for size-0 mode)
++    recordProfileTrace("INSERT", pw.startPC, pw.cost, pw.size);
++
++    if (numSets == 0)
++        return;
++
++    if (pw.containsRomUops)
++        return;
++
++    unsigned setIdx = getSetIndex(pw.startPC);
++    auto &set = sets[setIdx];
++
++    unsigned neededWays = std::min(numWays, std::max(1u, pw.size));
++
++    // Check if an entry with the same start PC is already present
++    // Paper Section II-D: Keep larger prediction windows for partial hits
++    for (unsigned w = 0; w < numWays; ++w) {
++        auto &entry = set.entries[w];
++        if (entry.valid && entry.tag == pw.startPC) {
++            if (pw.cost >= entry.pwCost) {
++                // Replace with larger window to maximize partial hit opportunity
++                entry.endPC = pw.endPC;
++                entry.physBlkAddr = pw.physBlkAddr;
++                entry.uops = pw.uops;
++                entry.pwCost = pw.cost;
++                entry.pwSize = neededWays;
++                entry.weight = pw.weight;
++                entry.rrpv = 2;
++                entry.lastTouchTick = curTick();
++                entry.nextAccess = getNextAccess(pw.startPC, accessCounter > 0 ? accessCounter - 1 : 0);
++                DPRINTF(UopCache, "UopCache updated existing PW with larger window at PC 0x%lx\n",
++                        pw.startPC);
++            }
++            return;
++        }
++    }
++
++    // 1. Evaluate Bypass Decision ONCE up front before evicting anything!
++    bool bypass = false;
++    if (replPolicy == UopCacheReplPolicy::FURBYS) {
++        uint8_t minWeight = 255;
++        bool hasValid = false;
++        for (unsigned w = 0; w < numWays; ++w) {
++            if (set.entries[w].valid) {
++                minWeight = std::min(minWeight, set.entries[w].weight);
++                hasValid = true;
++            }
++        }
++        if (hasValid && (int)pw.weight + furbysBypassThresholdK < (int)minWeight) {
++            bypass = true;
++        }
++    } else if (replPolicy == UopCacheReplPolicy::FLACK) {
++        double newUnitCost = (double)pw.cost / (double)neededWays;
++        double minUnitCost = 1e12;
++        bool hasValid = false;
++        for (unsigned w = 0; w < numWays; ++w) {
++            if (set.entries[w].valid) {
++                minUnitCost = std::min(minUnitCost,
++                    (double)set.entries[w].pwCost / (double)set.entries[w].pwSize);
++                hasValid = true;
++            }
++        }
++        if (hasValid && newUnitCost < minUnitCost) {
++            bypass = true;
++        }
++    }
++
++    if (bypass) {
++        stats.bypasses++;
++        DPRINTF(UopCache, "UopCache BYPASS insertion for PC 0x%lx (weight %u)\n",
++                pw.startPC, pw.weight);
++        return;
++    }
++
++    // 2. Count ways currently occupied by valid PWs in the set
++    unsigned waysUsed = 0;
++    for (unsigned w = 0; w < numWays; ++w) {
++        if (set.entries[w].valid) {
++            waysUsed += set.entries[w].pwSize;
++        }
++    }
++
++    // 3. Evict victim entries until waysUsed + neededWays <= numWays
++    while (waysUsed + neededWays > numWays) {
++        unsigned victimWay = 0;
++        bool dummyBypass = false;
++
++        switch (replPolicy) {
++          case UopCacheReplPolicy::LRU:
++            victimWay = selectVictimLRU(setIdx);
++            break;
++          case UopCacheReplPolicy::SRRIP:
++            victimWay = selectVictimSRRIP(setIdx);
++            break;
++          case UopCacheReplPolicy::BELADY:
++            victimWay = selectVictimBelady(setIdx);
++            break;
++          case UopCacheReplPolicy::FLACK:
++            victimWay = selectVictimFLACK(setIdx, pw, dummyBypass);
++            break;
++          case UopCacheReplPolicy::FURBYS:
++            victimWay = selectVictimFURBYS(setIdx, pw, dummyBypass);
++            break;
++          default:
++            victimWay = selectVictimLRU(setIdx);
++            break;
++        }
++
++        auto &victimEntry = set.entries[victimWay];
++        if (victimEntry.valid) {
++            waysUsed -= victimEntry.pwSize;
++            victimEntry.valid = false;
++            victimEntry.uops.clear();
++            stats.evictions++;
++            DPRINTF(UopCache, "UopCache EVICT way %u (PC 0x%lx, weight %u)\n",
++                    victimWay, victimEntry.tag, victimEntry.weight);
++        } else {
++            break; // No more valid entries to evict
++        }
++    }
++
++    // 4. Allocate the new PW into an available invalid slot
++    for (unsigned w = 0; w < numWays; ++w) {
++        auto &entry = set.entries[w];
++        if (!entry.valid) {
++            entry.valid = true;
++            entry.tag = pw.startPC;
++            entry.endPC = pw.endPC;
++            entry.physBlkAddr = pw.physBlkAddr;
++            entry.uops = pw.uops;
++            entry.pwCost = pw.cost;
++            entry.pwSize = neededWays;
++            entry.weight = pw.weight;
++            entry.rrpv = 2; // Initial RRPV
++            entry.lastTouchTick = curTick();
++            entry.nextAccess = getNextAccess(pw.startPC, accessCounter > 0 ? accessCounter - 1 : 0);
++
++            stats.insertions++; // Count ONLY real allocations
++            DPRINTF(UopCache, "UopCache allocated PW into way %u at PC 0x%lx (uops %zu, size %u, weight %u)\n",
++                    w, pw.startPC, pw.uops.size(), entry.pwSize, pw.weight);
++            return;
++        }
++    }
++}
++
++unsigned
++UopCache::selectVictimLRU(unsigned setIdx)
++{
++    auto &set = sets[setIdx];
++    Tick oldest = MaxTick;
++    unsigned victim = 0;
++
++    for (unsigned w = 0; w < numWays; ++w) {
++        if (!set.entries[w].valid)
++            return w;
++        if (set.entries[w].lastTouchTick < oldest) {
++            oldest = set.entries[w].lastTouchTick;
++            victim = w;
++        }
++    }
++    return victim;
++}
++
++unsigned
++UopCache::peekVictimSRRIP(unsigned setIdx)
++{
++    // Finds candidate with max RRPV without modifying state
++    auto &set = sets[setIdx];
++    uint8_t maxRRPV = 0;
++    unsigned candidate = 0;
++
++    for (unsigned w = 0; w < numWays; ++w) {
++        if (!set.entries[w].valid)
++            return w;
++        if (set.entries[w].rrpv >= maxRRPV) {
++            maxRRPV = set.entries[w].rrpv;
++            candidate = w;
++        }
++    }
++    return candidate;
++}
++
++unsigned
++UopCache::selectVictimSRRIP(unsigned setIdx)
++{
++    auto &set = sets[setIdx];
++
++    // Standard SRRIP: search for RRPV == 3; age entries until one reaches 3
++    while (true) {
++        for (unsigned w = 0; w < numWays; ++w) {
++            if (!set.entries[w].valid)
++                return w;
++            if (set.entries[w].rrpv >= 3) {
++                return w;
++            }
++        }
++        for (unsigned w = 0; w < numWays; ++w) {
++            if (set.entries[w].rrpv < 3) {
++                set.entries[w].rrpv++;
++            }
++        }
++    }
++}
++
++unsigned
++UopCache::selectVictimBelady(unsigned setIdx)
++{
++    auto &set = sets[setIdx];
++    uint64_t furthest = 0;
++    unsigned victim = 0;
++
++    for (unsigned w = 0; w < numWays; ++w) {
++        if (!set.entries[w].valid)
++            return w;
++        if (set.entries[w].nextAccess == UINT64_MAX) {
++            return w; // No future access, prime victim
++        }
++        if (set.entries[w].nextAccess > furthest) {
++            furthest = set.entries[w].nextAccess;
++            victim = w;
++        }
++    }
++    return victim;
++}
++
++unsigned
++UopCache::selectVictimFLACK(unsigned setIdx, const PredictionWindow &newPW, bool &bypass)
++{
++    // Cost-Aware Greedy (FLACK-inspired) victim selection
++    auto &set = sets[setIdx];
++    double minUnitCost = 1e12;
++    unsigned minWay = 0;
++
++    for (unsigned w = 0; w < numWays; ++w) {
++        if (!set.entries[w].valid) {
++            bypass = false;
++            return w;
++        }
++        auto &entry = set.entries[w];
++        double entryUnitCost = (double)entry.pwCost / (double)(entry.pwSize > 0 ? entry.pwSize : 1);
++        if (entryUnitCost < minUnitCost) {
++            minUnitCost = entryUnitCost;
++            minWay = w;
++        }
++    }
++
++    bypass = false;
++    return minWay;
++}
++
++unsigned
++UopCache::selectVictimFURBYS(unsigned setIdx, const PredictionWindow &newPW, bool &bypass)
++{
++    auto &set = sets[setIdx];
++
++    // Step 1: Min Module with tie-breaking
++    // Tie-break rule: lowest weight -> highest RRPV -> oldest lastTouchTick
++    uint8_t minWeight = 255;
++    uint8_t maxRRPV = 0;
++    Tick oldestTick = MaxTick;
++    unsigned furbysVictim = 0;
++
++    for (unsigned w = 0; w < numWays; ++w) {
++        if (!set.entries[w].valid) {
++            bypass = false;
++            return w;
++        }
++
++        auto &entry = set.entries[w];
++        bool isBetter = false;
++
++        if (entry.weight < minWeight) {
++            isBetter = true;
++        } else if (entry.weight == minWeight) {
++            if (entry.rrpv > maxRRPV) {
++                isBetter = true;
++            } else if (entry.rrpv == maxRRPV) {
++                if (entry.lastTouchTick < oldestTick) {
++                    isBetter = true;
++                }
++            }
++        }
++
++        if (isBetter) {
++            minWeight = entry.weight;
++            maxRRPV = entry.rrpv;
++            oldestTick = entry.lastTouchTick;
++            furbysVictim = w;
++        }
++    }
++
++    bypass = false;
++
++    // Step 2: 2-slot local miss-pitfall detection (Paper Section V & VI-D)
++    // Paper: "a two-slot miss-pitfall detector is used for each cache set to store
++    // recently evicted ways. When we evict the same way twice, we will switch to SRRIP
++    // to evict hot PWs that are temporarily cold. After that, we switch back to normal FURBYS."
++    bool isPitfall = false;
++    for (unsigned way : set.pitfallBuffer) {
++        if (way == furbysVictim) {
++            isPitfall = true;
++            break;
++        }
++    }
++
++    unsigned chosenVictim = furbysVictim;
++    if (isPitfall) {
++        // Repeated eviction detected in 2-slot history: degrade to SRRIP!
++        chosenVictim = selectVictimSRRIP(setIdx);
++        set.pitfallBuffer.clear(); // Reset detector after fallback
++        stats.furbysDegradedDecisions++;
++        DPRINTF(UopCache, "UopCache FURBYS pitfall triggered on way %u! Fallback to SRRIP -> way %u\n",
++                furbysVictim, chosenVictim);
++    } else {
++        set.pitfallBuffer.push_back(furbysVictim);
++        if (set.pitfallBuffer.size() > pitfallDepth) {
++            set.pitfallBuffer.pop_front();
++        }
++        stats.furbysNormalDecisions++;
++    }
++
++    return chosenVictim;
++}
++
++void
++UopCache::invalidateByIcacheAddr(Addr icacheBlkAddr, Addr blkSize)
++{
++    if (!enabled || !inclusive || numSets == 0)
++        return;
++
++    Addr blkMask = ~Addr(blkSize - 1);
++    Addr targetPhysBlk = icacheBlkAddr & blkMask;
++
++    for (unsigned s = 0; s < numSets; ++s) {
++        for (unsigned w = 0; w < numWays; ++w) {
++            auto &entry = sets[s].entries[w];
++            if (entry.valid && (entry.physBlkAddr & blkMask) == targetPhysBlk) {
++                entry.valid = false;
++                entry.uops.clear();
++                stats.inclusivenessInvalidations++;
++                DPRINTF(UopCache, "UopCache inclusiveness invalidation: physBlk 0x%lx (set %u, way %u)\n",
++                        targetPhysBlk, s, w);
++            }
++        }
++    }
++}
++
++void
++UopCache::clear()
++{
++    for (auto &set : sets) {
++        for (auto &entry : set.entries) {
++            entry.valid = false;
++            entry.uops.clear();
++        }
++        set.pitfallBuffer.clear();
++    }
++    pendingInsertions.clear();
++}
++
++uint8_t
++UopCache::getWeightForAddress(Addr addr) const
++{
++    auto it = furbysWeights.find(addr);
++    if (it != furbysWeights.end()) {
++        return it->second;
++    }
++    // Default weight for unprofiled PWs: 0 (coldest group, matching paper)
++    return 0;
++}
++
++bool
++UopCache::loadWeightFile(const std::string &path)
++{
++    std::ifstream file(path);
++    if (!file.is_open()) {
++        warn("UopCache: Unable to open FURBYS weight file: %s\n", path);
++        return false;
++    }
++
++    std::string line;
++    unsigned count = 0;
++    while (std::getline(file, line)) {
++        if (line.empty() || line[0] == '#')
++            continue;
++        std::stringstream ss(line);
++        std::string addrStr;
++        unsigned weight = 0;
++        if (ss >> addrStr >> weight) {
++            Addr addr = 0;
++            if (addrStr.find("0x") == 0 || addrStr.find("0X") == 0) {
++                addr = std::stoull(addrStr, nullptr, 16);
++            } else {
++                addr = std::stoull(addrStr, nullptr, 10);
++            }
++            furbysWeights[addr] = (uint8_t)(weight & 0x7);
++            count++;
++        }
++    }
++    inform("UopCache: Loaded %u FURBYS weights from %s\n", count, path);
++    return true;
++}
++
++bool
++UopCache::loadTraceFile(const std::string &path)
++{
++    std::ifstream file(path);
++    if (!file.is_open()) {
++        warn("UopCache: Unable to open trace file: %s\n", path);
++        return false;
++    }
++
++    std::string line;
++    uint64_t accessIndex = 0;
++    while (std::getline(file, line)) {
++        if (line.empty() || line[0] == '#')
++            continue;
++        std::stringstream ss(line);
++        std::string tag, addrStr;
++        if (ss >> tag >> addrStr) {
++            // Index ONLY LOOKUP lines to maintain exact 1:1 synchronization with accessCounter
++            if (tag == "LOOKUP") {
++                Addr addr = 0;
++                if (addrStr.find("0x") == 0 || addrStr.find("0X") == 0) {
++                    addr = std::stoull(addrStr, nullptr, 16);
++                } else {
++                    addr = std::stoull(addrStr, nullptr, 10);
++                }
++                futureAccessTrace[addr].push_back(accessIndex++);
++            }
++        }
++    }
++    inform("UopCache: Loaded %lu future access trace events from %s\n", accessIndex, path);
++    return true;
++}
++
++} // namespace o3
++} // namespace gem5
+diff --git a/src/cpu/o3/uop_cache.hh b/src/cpu/o3/uop_cache.hh
+new file mode 100644
+index 0000000000..0398290e15
+--- /dev/null
++++ b/src/cpu/o3/uop_cache.hh
+@@ -0,0 +1,344 @@
++/*
++ * Copyright (c) 2026 Group 16 (Kabir Gupta, Jayesh Vijaivargia, Mahendra)
++ * All rights reserved.
++ *
++ * Micro-op Cache Implementation for gem5 O3CPU
++ * Based on the HPCA 2025 paper:
++ * "From Optimal to Practical: Efficient Micro-op Cache Replacement Policies
++ *  for Data Center Applications" by Kan Zhu et al.
++ */
++
++#ifndef __CPU_O3_UOP_CACHE_HH__
++#define __CPU_O3_UOP_CACHE_HH__
++
++#include <algorithm>
++#include <cassert>
++#include <cmath>
++#include <deque>
++#include <fstream>
++#include <memory>
++#include <sstream>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++#include "arch/generic/pcstate.hh"
++#include "base/statistics.hh"
++#include "base/types.hh"
++#include "cpu/inst_seq.hh"
++#include "cpu/static_inst.hh"
++
++namespace gem5
++{
++
++struct BaseO3CPUParams;
++
++namespace o3
++{
++
++class CPU;
++
++/**
++ * A cached micro-op and its parent macro-op, along with exact pre-computed
++ * PC and next-PC states to guarantee exact instruction stream replay.
++ */
++struct CachedUop
++{
++    StaticInstPtr staticInst;
++    StaticInstPtr macroop;
++    std::unique_ptr<PCStateBase> pc;
++    std::unique_ptr<PCStateBase> nextPC;
++
++    CachedUop() : staticInst(nullptr), macroop(nullptr) {}
++    CachedUop(StaticInstPtr sInst, StaticInstPtr mInst,
++              const PCStateBase *p = nullptr, const PCStateBase *np = nullptr)
++        : staticInst(sInst), macroop(mInst),
++          pc(p ? p->clone() : nullptr),
++          nextPC(np ? np->clone() : nullptr) {}
++    CachedUop(const CachedUop &other)
++        : staticInst(other.staticInst), macroop(other.macroop),
++          pc(other.pc ? other.pc->clone() : nullptr),
++          nextPC(other.nextPC ? other.nextPC->clone() : nullptr) {}
++    CachedUop& operator=(const CachedUop &other) {
++        if (this != &other) {
++            staticInst = other.staticInst;
++            macroop = other.macroop;
++            pc = other.pc ? other.pc->clone() : nullptr;
++            nextPC = other.nextPC ? other.nextPC->clone() : nullptr;
++        }
++        return *this;
++    }
++};
++
++/**
++ * A Prediction Window (PW).
++ * A PW begins at a branch target or cache line boundary and ends at a predicted
++ * taken branch or cache line boundary.
++ */
++struct PredictionWindow
++{
++    Addr startPC;
++    Addr endPC;
++    Addr physBlkAddr; // Physical cache line address for strict inclusiveness
++    std::vector<CachedUop> uops;
++    unsigned cost;    // Number of micro-ops in the PW
++    unsigned size;    // Number of entries occupied (ceil(cost / uopsPerEntry))
++    uint8_t weight;   // 3-bit weight group (0..7) for FURBYS (0 = coldest)
++    uint64_t pwId;
++    bool containsRomUops; // True if window contains microcode ROM instructions
++
++    PredictionWindow()
++        : startPC(0), endPC(0), physBlkAddr(0), cost(0), size(0),
++          weight(0), pwId(0), containsRomUops(false)
++    {}
++};
++
++/**
++ * A single entry in the micro-op cache.
++ */
++struct UopCacheEntry
++{
++    bool valid;
++    Addr tag;           // PW start virtual PC
++    Addr endPC;         // End PC of the PW
++    Addr physBlkAddr;   // Physical line address for icache inclusiveness
++    std::vector<CachedUop> uops;
++    uint64_t pwId;
++    unsigned pwCost;    // Micro-op count
++    unsigned pwSize;    // Entry count
++    uint8_t weight;     // 3-bit weight for FURBYS (0..7)
++    uint8_t rrpv;       // 2-bit RRPV (0..3) for SRRIP / FURBYS fallback
++    Tick lastTouchTick; // For LRU
++    uint64_t nextAccess; // For offline Belady / FLACK
++
++    UopCacheEntry()
++        : valid(false), tag(0), endPC(0), physBlkAddr(0), pwId(0),
++          pwCost(0), pwSize(0), weight(0), rrpv(2), lastTouchTick(0),
++          nextAccess(UINT64_MAX)
++    {}
++};
++
++/**
++ * A cache set in the micro-op cache.
++ */
++struct UopCacheSet
++{
++    std::vector<UopCacheEntry> entries;
++    // 2-slot local miss-pitfall detector: records recent evicted way indices.
++    std::deque<unsigned> pitfallBuffer;
++};
++
++/**
++ * Pending insertion item to model asynchronous decoder insertion delay.
++ */
++struct PendingUopInsertion
++{
++    PredictionWindow pw;
++    Tick readyTick;
++};
++
++/**
++ * Supported Replacement Policies.
++ */
++enum class UopCacheReplPolicy
++{
++    LRU,
++    SRRIP,
++    BELADY,
++    FLACK,   // Cost-Aware Greedy (FLACK-inspired) or Offline Trace Replay
++    FURBYS
++};
++
++/**
++ * Accumulation Buffer:
++ * Accumulates decoded micro-ops from the legacy decode pipeline into a PW.
++ */
++class AccumulationBuffer
++{
++  private:
++    PredictionWindow currentPW;
++    bool accumulating;
++    unsigned maxUopsPerEntry;
++
++  public:
++    AccumulationBuffer(unsigned uops_per_entry = 8)
++        : accumulating(false), maxUopsPerEntry(uops_per_entry)
++    {}
++
++    void reset()
++    {
++        currentPW = PredictionWindow();
++        accumulating = false;
++    }
++
++    void startWindow(Addr startPC, Addr physBlkAddr = 0, uint8_t weight = 0)
++    {
++        currentPW = PredictionWindow();
++        currentPW.startPC = startPC;
++        currentPW.physBlkAddr = physBlkAddr;
++        currentPW.weight = weight;
++        accumulating = true;
++    }
++
++    void addUop(const StaticInstPtr &staticInst, const StaticInstPtr &macroop,
++                const PCStateBase &this_pc, const PCStateBase &next_pc,
++                bool inRom, Addr physBlkAddr = 0)
++    {
++        if (!accumulating) {
++            startWindow(this_pc.instAddr(), physBlkAddr);
++        }
++        currentPW.uops.emplace_back(staticInst, macroop, &this_pc, &next_pc);
++        if (inRom) {
++            currentPW.containsRomUops = true;
++        }
++        currentPW.endPC = this_pc.instAddr();
++        currentPW.physBlkAddr = physBlkAddr;
++        currentPW.cost = currentPW.uops.size();
++        currentPW.size = (currentPW.cost + maxUopsPerEntry - 1) / maxUopsPerEntry;
++    }
++
++    bool hasPendingPW() const
++    {
++        return accumulating && !currentPW.uops.empty();
++    }
++
++    Addr getStartPC() const
++    {
++        return currentPW.startPC;
++    }
++
++    PredictionWindow finalizeWindow(Addr endPC)
++    {
++        currentPW.endPC = endPC;
++        currentPW.cost = currentPW.uops.size();
++        currentPW.size = (currentPW.cost + maxUopsPerEntry - 1) / maxUopsPerEntry;
++        PredictionWindow pw = currentPW;
++        reset();
++        return pw;
++    }
++};
++
++/**
++ * Micro-op Cache for the O3 CPU.
++ */
++class UopCache
++{
++  protected:
++    CPU *cpu;
++
++    // Configuration parameters
++    bool enabled;
++    unsigned numEntries;
++    unsigned numWays;
++    unsigned uopsPerEntry;
++    unsigned numSets;
++    unsigned setMask;
++    unsigned setShift;
++    bool isSetPowerOfTwo;
++    UopCacheReplPolicy replPolicy;
++    Cycles switchDelay;
++    Cycles decodeDelay;
++    bool inclusive;
++    int furbysBypassThresholdK;
++    unsigned pitfallDepth;
++
++    // Sets and storage
++    std::vector<UopCacheSet> sets;
++    std::deque<PendingUopInsertion> pendingInsertions;
++
++    // FURBYS offline profile weight table (Addr -> weight 0..7)
++    std::unordered_map<Addr, uint8_t> furbysWeights;
++
++    // Belady / FLACK offline access trace mapping (Addr -> list of future access times)
++    std::unordered_map<Addr, std::deque<uint64_t>> futureAccessTrace;
++    uint64_t accessCounter;
++    uint64_t nextPwId;
++
++    // Trace dump output file for offline profiling
++    std::string profileOutputFilePath;
++    std::ofstream profileOutputStream;
++
++  public:
++    struct UopCacheStatGroup : public statistics::Group
++    {
++        UopCacheStatGroup(statistics::Group *parent);
++
++        statistics::Scalar lookups;
++        statistics::Scalar hits;
++        statistics::Scalar partialHits;
++        statistics::Scalar misses;
++        statistics::Scalar uopHits;
++        statistics::Scalar uopMisses;
++        statistics::Scalar insertions;
++        statistics::Scalar evictions;
++        statistics::Scalar bypasses;
++        statistics::Scalar furbysNormalDecisions;
++        statistics::Scalar furbysDegradedDecisions;
++        statistics::Scalar inclusivenessInvalidations;
++        statistics::Formula hitRate;
++        statistics::Formula uopHitRate;
++    } stats;
++
++  public:
++    UopCache(CPU *_cpu, const BaseO3CPUParams &params);
++    ~UopCache();
++
++    bool isEnabled() const { return enabled; }
++    Cycles getSwitchDelay() const { return switchDelay; }
++    Cycles getDecodeDelay() const { return decodeDelay; }
++
++    /** Advance asynchronous insertions */
++    void tick();
++
++    /**
++     * Lookup micro-op cache by starting PC.
++     * Returns true on hit (populating outUops), false on miss.
++     */
++    bool lookup(Addr pc, std::vector<CachedUop> &outUops, bool &partialHit);
++
++    /**
++     * Insert a completed Prediction Window into the micro-op cache.
++     * Takes into account decode latency (asynchronous insertion).
++     */
++    void insert(const PredictionWindow &pw);
++
++    /** Invalidate cache entries by physical icache line address (inclusiveness). */
++    void invalidateByIcacheAddr(Addr icacheBlkAddr, Addr blkSize);
++
++    /** Flush/clear all entries. */
++    void clear();
++
++    /** Get 3-bit FURBYS weight for an address from profiling table (default: 0). */
++    uint8_t getWeightForAddress(Addr addr) const;
++
++    /** Load FURBYS weight file generated by offline Jenks clustering. */
++    bool loadWeightFile(const std::string &path);
++
++    /** Load future access trace for Belady or FLACK offline policies. */
++    bool loadTraceFile(const std::string &path);
++
++    /** Increment statistics from frontend */
++    void incUopMisses(unsigned count = 1) { stats.uopMisses += count; }
++    void incUopHits(unsigned count = 1) { stats.uopHits += count; }
++    void incPartialHits(unsigned count = 1) { stats.partialHits += count; }
++
++  protected:
++    unsigned getSetIndex(Addr pc) const;
++    void doInsert(const PredictionWindow &pw);
++    uint64_t getNextAccess(Addr pc, uint64_t currentAccess);
++
++    // Replacement Policy Helpers
++    unsigned selectVictimLRU(unsigned setIdx);
++    unsigned peekVictimSRRIP(unsigned setIdx);
++    unsigned selectVictimSRRIP(unsigned setIdx);
++    unsigned selectVictimBelady(unsigned setIdx);
++    unsigned selectVictimFLACK(unsigned setIdx, const PredictionWindow &newPW, bool &bypass);
++    unsigned selectVictimFURBYS(unsigned setIdx, const PredictionWindow &newPW, bool &bypass);
++
++    void recordProfileTrace(const char *eventType, Addr pc, unsigned cost, unsigned size);
++};
++
++} // namespace o3
++} // namespace gem5
++
++#endif // __CPU_O3_UOP_CACHE_HH__
+diff --git a/util/uop_cache/flack_offline_solver.py b/util/uop_cache/flack_offline_solver.py
+new file mode 100755
+index 0000000000..b8479b5367
+--- /dev/null
++++ b/util/uop_cache/flack_offline_solver.py
+@@ -0,0 +1,158 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 Group 16 (Kabir Gupta, Jayesh Vijaivargia, Mahendra)
++# All rights reserved.
++"""
++Cost-Aware Greedy (FLACK-inspired) Policy Simulator
++Based on HPCA 2025:
++"From Optimal to Practical: Efficient Micro-op Cache Replacement Policies
++ for Data Center Applications" by Kan Zhu et al.
++
++This simulator models a Cost-Aware Greedy (FLACK-inspired) policy with three
++micro-op cache specific features:
++  1. Variable disproportional costs: unit cost = cost / size (uops / entries)
++  2. Selective bypass: prioritize keeping larger windows, bypass if unit cost is lower than cache
++  3. Lazy eviction: delay eviction until insertion time
++
++Note: This is an online/trace-based greedy heuristic derived from FLACK's principles,
++not the full offline Flow-based Optimal (FOO) min-cost circulation solver.
++"""
++
++import sys
++import collections
++
++class PredictionWindow:
++    def __init__(self, start_pc, cost, size):
++        self.start_pc = start_pc
++        self.cost = max(1, cost)
++        self.size = max(1, size)
++        self.unit_cost = self.cost / self.size  # uops per entry
++
++class CostAwareGreedySimulator:
++    def __init__(self, num_sets=64, num_ways=8, uops_per_entry=8):
++        self.num_sets = num_sets
++        self.num_ways = num_ways
++        self.uops_per_entry = uops_per_entry
++        self.set_mask = num_sets - 1
++        self.set_shift = 2
++
++        # Cache state: per-set list of cached windows
++        self.cache = {s: [] for s in range(num_sets)}
++
++        # Statistics per PC: {pc: {'accesses': N, 'hits': H, 'uop_hits': UH, 'uop_misses': UM}}
++        self.stats = collections.defaultdict(lambda: {
++            'accesses': 0, 'hits': 0, 'uop_hits': 0, 'uop_misses': 0
++        })
++
++    def get_set(self, pc):
++        return (pc >> self.set_shift) & self.set_mask
++
++    def access(self, pw):
++        pc = pw.start_pc
++        s = self.get_set(pc)
++        stat = self.stats[pc]
++        stat['accesses'] += 1
++
++        cached_set = self.cache[s]
++
++        # Check for hit or partial hit
++        hit_idx = -1
++        for i, item in enumerate(cached_set):
++            if item.start_pc == pc:
++                hit_idx = i
++                break
++
++        if hit_idx != -1:
++            # Hit!
++            stat['hits'] += 1
++            stat['uop_hits'] += pw.cost
++            # If incoming window is larger, update cached window (partial hit optimization)
++            if pw.cost > cached_set[hit_idx].cost:
++                cached_set[hit_idx] = pw
++            return True
++        else:
++            # Miss!
++            stat['uop_misses'] += pw.cost
++
++            # Insertion decision with cost-aware greedy:
++            if len(cached_set) < self.num_ways:
++                cached_set.append(pw)
++            else:
++                # All ways full: select victim based on variable unit cost
++                min_idx = 0
++                min_unit_cost = cached_set[0].unit_cost
++                for i in range(1, len(cached_set)):
++                    if cached_set[i].unit_cost < min_unit_cost:
++                        min_unit_cost = cached_set[i].unit_cost
++                        min_idx = i
++
++                # Selective bypass:
++                # If incoming window's unit cost is lower than everything in cache, bypass!
++                if pw.unit_cost < min_unit_cost:
++                    # Bypass insertion
++                    pass
++                else:
++                    # Evict victim and insert pw (lazy eviction at insertion time)
++                    cached_set[min_idx] = pw
++            return False
++
++    def compute_hit_rates(self):
++        """Returns dict: pc -> hit_rate (0.0 to 1.0)"""
++        hit_rates = {}
++        for pc, s in self.stats.items():
++            if s['accesses'] > 0:
++                hit_rates[pc] = s['hits'] / s['accesses']
++            else:
++                hit_rates[pc] = 0.0
++        return hit_rates
++
++def parse_trace_and_solve(trace_path, num_sets=64, num_ways=8):
++    """
++    Two-pass trace processor:
++    Pass 1: Collect (cost, size) metadata for each PC from INSERT lines.
++    Pass 2: Replay only LOOKUP lines to simulate the exact access sequence.
++    """
++    sim = CostAwareGreedySimulator(num_sets=num_sets, num_ways=num_ways)
++    pw_info = {}
++
++    # Pass 1: Collect PW metadata
++    with open(trace_path, 'r') as f:
++        for line in f:
++            line = line.strip()
++            if not line or line.startswith('#'):
++                continue
++            parts = line.split()
++            if len(parts) >= 4 and parts[0] in ("INSERT", "PW"):
++                pc = int(parts[1], 16) if parts[1].startswith("0x") else int(parts[1])
++                cost = int(parts[2])
++                size = int(parts[3])
++                # Keep the largest cost observed for this PC
++                if pc not in pw_info or cost > pw_info[pc][0]:
++                    pw_info[pc] = (cost, size)
++
++    # Pass 2: Replay LOOKUP accesses
++    with open(trace_path, 'r') as f:
++        for line in f:
++            line = line.strip()
++            if not line or line.startswith('#'):
++                continue
++            parts = line.split()
++            if len(parts) >= 2 and parts[0] == "LOOKUP":
++                pc = int(parts[1], 16) if parts[1].startswith("0x") else int(parts[1])
++                cost, size = pw_info.get(pc, (1, 1))
++                sim.access(PredictionWindow(pc, cost, size))
++
++    return sim.compute_hit_rates()
++
++if __name__ == "__main__":
++    if len(sys.argv) < 2:
++        print("Usage: flack_offline_solver.py <trace_file> [num_sets=64] [num_ways=8]")
++        sys.exit(1)
++
++    trace_file = sys.argv[1]
++    num_sets = int(sys.argv[2]) if len(sys.argv) > 2 else 64
++    num_ways = int(sys.argv[3]) if len(sys.argv) > 3 else 8
++
++    hit_rates = parse_trace_and_solve(trace_file, num_sets, num_ways)
++    print(f"Processed {len(hit_rates)} unique Prediction Windows under Cost-Aware Greedy (FLACK-inspired).")
++    for pc, hr in sorted(hit_rates.items(), key=lambda x: x[1], reverse=True)[:20]:
++        print(f"  PC: 0x{pc:x} -> Hit Rate: {hr*100:.2f}%")
+diff --git a/util/uop_cache/generate_furbys_weights.py b/util/uop_cache/generate_furbys_weights.py
+new file mode 100755
+index 0000000000..cea6c5b07f
+--- /dev/null
++++ b/util/uop_cache/generate_furbys_weights.py
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 Group 16 (Kabir Gupta, Jayesh Vijaivargia, Mahendra)
++# All rights reserved.
++"""
++FURBYS Offline Profile Generator (HPCA 2025)
++Pipeline:
++  1. Reads PW execution trace from gem5 simulation
++  2. Runs Cost-Aware Greedy (FLACK-inspired) replacement policy
++  3. Computes hit rate for each Prediction Window
++  4. Applies Jenks Natural Breaks per cache set to cluster hit rates into 8 weight buckets (0 to 7)
++  5. Outputs formatted weight file for gem5 FURBYS simulation:
++       0x<addr> <weight:0..7>
++"""
++
++import sys
++import os
++import collections
++from flack_offline_solver import parse_trace_and_solve
++from jenks_natural_breaks import assign_weights
++
++def generate_weights(trace_path, output_path, num_sets=64, num_ways=8, num_groups=8, set_shift=2):
++    print(f"[FURBYS Profile] Reading trace from {trace_path}...")
++    hit_rates = parse_trace_and_solve(trace_path, num_sets=num_sets, num_ways=num_ways)
++
++    print(f"[FURBYS Profile] Replayed {len(hit_rates)} unique Prediction Windows under FLACK heuristic.")
++    print(f"[FURBYS Profile] Partitioning into {num_sets} sets and clustering per-set into {num_groups} Jenks Natural Break groups...")
++
++    # Group PW hit rates by cache set
++    sets_hit_rates = collections.defaultdict(dict)
++    for pc, hr in hit_rates.items():
++        s = (pc >> set_shift) % num_sets
++        sets_hit_rates[s][pc] = hr
++
++    weights = {}
++    for s in range(num_sets):
++        if s in sets_hit_rates:
++            set_weights = assign_weights(sets_hit_rates[s], num_groups=num_groups)
++            weights.update(set_weights)
++
++    print(f"[FURBYS Profile] Writing weight profile to {output_path}...")
++    with open(output_path, 'w') as f:
++        f.write("# FURBYS Profile Weights generated via FLACK heuristic and per-set Jenks Natural Breaks\n")
++        f.write("# Format: 0x<PC> <Weight_0_to_7>\n")
++        for pc, w in sorted(weights.items()):
++            f.write(f"0x{pc:x} {w}\n")
++
++    print(f"[FURBYS Profile] Successfully generated weights for {len(weights)} PWs!")
++
++    # Summary histogram
++    group_counts = [0] * num_groups
++    for w in weights.values():
++        group_counts[w] += 1
++    print("\nWeight Distribution:")
++    for g, count in enumerate(group_counts):
++        bar = "#" * int(count / max(1, len(weights)) * 40)
++        print(f"  Group {g} (weight {g}): {count:5d} PWs {bar}")
++
++if __name__ == "__main__":
++    if len(sys.argv) < 3:
++        print("Usage: generate_furbys_weights.py <input_trace.txt> <output_weights.txt> [num_sets=64] [num_ways=8]")
++        sys.exit(1)
++
++    trace_file = sys.argv[1]
++    out_file = sys.argv[2]
++    num_sets = int(sys.argv[3]) if len(sys.argv) > 3 else 64
++    num_ways = int(sys.argv[4]) if len(sys.argv) > 4 else 8
++
++    generate_weights(trace_file, out_file, num_sets=num_sets, num_ways=num_ways)
+diff --git a/util/uop_cache/jenks_natural_breaks.py b/util/uop_cache/jenks_natural_breaks.py
+new file mode 100755
+index 0000000000..b1a32b5b1c
+--- /dev/null
++++ b/util/uop_cache/jenks_natural_breaks.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 Group 16 (Kabir Gupta, Jayesh Vijaivargia, Mahendra)
++# All rights reserved.
++"""
++Jenks Natural Breaks (Fisher-Jenks Algorithm) for 1D Data Classification.
++Used by FURBYS (HPCA 2025) to partition micro-op cache hit rates into 8 weight buckets (0 to 7).
++"""
++
++def jenks_breaks(data, num_classes=8):
++    """
++    Computes k class break points for a sorted 1D array using the Fisher-Jenks algorithm.
++    """
++    data = sorted(data)
++    n = len(data)
++
++    if n <= num_classes:
++        # Trivial case: each unique value or item gets its own class
++        breaks = [data[i] for i in range(n)]
++        while len(breaks) < num_classes + 1:
++            breaks.append(data[-1] if breaks else 0.0)
++        return breaks
++
++    # Initialize matrices
++    # mat1: variance matrix, mat2: index matrix
++    mat1 = [[0.0] * (num_classes + 1) for _ in range(n + 1)]
++    mat2 = [[0] * (num_classes + 1) for _ in range(n + 1)]
++
++    for y in range(1, num_classes + 1):
++        mat1[1][y] = 0.0
++        mat2[1][y] = 1
++        for i in range(2, n + 1):
++            mat1[i][y] = float('inf')
++
++    v = 0.0
++    for l in range(2, n + 1):
++        s1 = 0.0
++        s2 = 0.0
++        w = 0.0
++        for m in range(1, l + 1):
++            i3 = l - m + 1
++            val = float(data[i3 - 1])
++            s2 += val * val
++            s1 += val
++            w += 1.0
++            v = s2 - (s1 * s1) / w
++            i4 = i3 - 1
++            if i4 != 0:
++                for j in range(2, num_classes + 1):
++                    if mat1[l][j] >= (v + mat1[i4][j - 1]):
++                        mat2[l][j] = i3
++                        mat1[l][j] = v + mat1[i4][j - 1]
++        mat1[l][1] = v
++        mat2[l][1] = 1
++
++    k = n
++    kclass = [0.0] * (num_classes + 1)
++    kclass[num_classes] = data[n - 1]
++
++    countNum = num_classes
++    while countNum >= 2:
++        id_ = int(mat2[k][countNum]) - 2
++        kclass[countNum - 1] = data[id_]
++        k = int(mat2[k][countNum]) - 1
++        countNum -= 1
++
++    return kclass
++
++def assign_weights(hit_rates, num_groups=8):
++    """
++    Given a dict: {pc: hit_rate}, computes Jenks Natural Breaks and returns
++    dict: {pc: weight_0_to_7}.
++    """
++    if not hit_rates:
++        return {}
++
++    values = sorted(hit_rates.values())
++    unique_vals = sorted(list(set(values)))
++
++    if len(unique_vals) <= num_groups:
++        val_to_weight = {v: min(num_groups - 1, i) for i, v in enumerate(unique_vals)}
++        return {pc: val_to_weight[hr] for pc, hr in hit_rates.items()}
++
++    breaks = jenks_breaks(values, num_classes=num_groups)
++
++    def get_group(val):
++        for g in range(num_groups):
++            if val <= breaks[g + 1]:
++                return g
++        return num_groups - 1
++
++    return {pc: get_group(hr) for pc, hr in hit_rates.items()}

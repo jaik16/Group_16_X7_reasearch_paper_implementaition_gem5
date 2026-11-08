@@ -175,38 +175,3 @@ class WeightedLRURP(LRURP):
     type = "WeightedLRURP"
     cxx_class = "gem5::replacement_policy::WeightedLRU"
     cxx_header = "mem/cache/replacement_policies/weighted_lru_rp.hh"
-
-
-class FURBYSRP(BaseReplacementPolicy):
-    type = "FURBYSRP"
-    cxx_class = "gem5::replacement_policy::FURBYS"
-    cxx_header = "mem/cache/replacement_policies/furbys_rp.hh"
-
-    num_weight_bits = Param.Unsigned(
-        3, "Number of bits for hit-rate weight group (0-7)"
-    )
-    num_rrpv_bits = Param.Unsigned(
-        2, "Number of bits for SRRIP RRPV"
-    )
-    bypass_k = Param.Int(
-        1, "Bypass margin K: bypass if weight < min_weight - K"
-    )
-    pitfall_depth = Param.Unsigned(
-        2, "Depth of local miss-pitfall detector"
-    )
-    num_sets = Param.Unsigned(
-        64, "Number of cache sets"
-    )
-    profile_file = Param.String(
-        "", "Path to offline Jenks Natural Breaks profile file"
-    )
-
-
-class FLACKRP(BaseReplacementPolicy):
-    type = "FLACKRP"
-    cxx_class = "gem5::replacement_policy::FLACK"
-    cxx_header = "mem/cache/replacement_policies/flack_rp.hh"
-
-    uops_per_entry = Param.Unsigned(
-        8, "Maximum number of micro-ops per entry"
-    )

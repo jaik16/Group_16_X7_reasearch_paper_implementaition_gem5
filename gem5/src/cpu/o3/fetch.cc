@@ -60,6 +60,7 @@
 #include "debug/Drain.hh"
 #include "debug/Fetch.hh"
 #include "debug/O3CPU.hh"
+#include "debug/UopCache.hh"
 #include "mem/packet.hh"
 #include "params/BaseO3CPU.hh"
 #include "sim/byteswap.hh"
@@ -136,6 +137,7 @@ Fetch::Fetch(CPU *_cpu, const BaseO3CPUParams &params)
       finishTranslationEvent(this),
       maxFTPerCycle(params.maxFTPerCycle),
       maxTakenPredPerCycle(params.maxTakenPredPerCycle),
+      uopCache(std::make_unique<UopCache>(_cpu, params)),
       fetchStats(_cpu, this)
 {
     if (numThreads > MaxThreads)
@@ -170,6 +172,14 @@ Fetch::Fetch(CPU *_cpu, const BaseO3CPUParams &params)
         fetchBufferValid[i] = false;
         lastIcacheStall[i] = 0;
         issuePipelinedIfetch[i] = false;
+        uopCacheServing[i] = false;
+        inUopCacheMode[i] = false;
+        atPWBoundary[i] = true;
+        activeUops[i].clear();
+        activeUopIdx[i] = 0;
+        uopCacheStallCycles[i] = Cycles(0);
+        fetchBufferPAddr[i] = 0;
+        accumulationBuffer[i] = AccumulationBuffer(params.uopCacheUopsPerEntry);
     }
 
     for (ThreadID tid = 0; tid < numThreads; tid++) {
@@ -454,7 +464,7 @@ Fetch::takeOverFrom()
 {
     assert(cpu->getInstPort().isConnected());
     resetStage();
-
+    switchToActive();
 }
 
 void
@@ -612,6 +622,7 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
         data_pkt->dataDynamic(new uint8_t[fetchBufferSize]);
 
         fetchBufferPC[tid] = fetchBufferBlockPC;
+        fetchBufferPAddr[tid] = mem_req->getPaddr() & ~Addr(cacheBlkSize - 1);
         fetchBufferValid[tid] = false;
         DPRINTF(Fetch, "Fetch: Doing instruction read.\n");
 
@@ -722,6 +733,15 @@ Fetch::doSquash(const PCStateBase &new_pc, const DynInstPtr squashInst,
         macroop[tid] = NULL;
     decoder[tid]->reset();
 
+    // Reset uop cache transient state on squash
+    uopCacheServing[tid] = false;
+    inUopCacheMode[tid] = false;
+    atPWBoundary[tid] = true;
+    activeUops[tid].clear();
+    activeUopIdx[tid] = 0;
+    accumulationBuffer[tid].reset();
+    uopCacheStallCycles[tid] = Cycles(0);
+
     // Clear the icache miss if it's outstanding.
     if (fetchStatus[tid] == IcacheWaitResponse) {
         DPRINTF(Fetch, "[tid:%i] Squashing outstanding Icache miss.\n",
@@ -820,6 +840,10 @@ Fetch::updateFetchStatus()
 void
 Fetch::tick()
 {
+    if (uopCache) {
+        uopCache->tick();
+    }
+
     bool status_change = false;
 
     wroteToTimeBuffer = false;
@@ -1117,13 +1141,44 @@ Fetch::fetch(bool &status_change)
         fetchStatus[tid] = Running;
         status_change = true;
     } else if (fetchStatus[tid] == Running) {
+        if (uopCacheStallCycles[tid] > Cycles(0)) {
+            --uopCacheStallCycles[tid];
+            return;
+        }
+
+        if (uopCache && uopCache->isEnabled() && !inRom && !macroop[tid]) {
+            if (!uopCacheServing[tid] && atPWBoundary[tid]) {
+                bool partialHit = false;
+                std::vector<CachedUop> uops;
+                if (uopCache->lookup(this_pc.instAddr(), uops, partialHit)) {
+                    uopCacheServing[tid] = true;
+                    inUopCacheMode[tid] = true;
+                    activeUops[tid] = std::move(uops);
+                    activeUopIdx[tid] = 0;
+                    atPWBoundary[tid] = false;
+                    decoder[tid]->reset();
+                } else {
+                    // Miss at PW boundary: charge 1-cycle penalty switch delay ONLY if
+                    // transitioning from uop-cache mode back to legacy pipeline!
+                    if (inUopCacheMode[tid]) {
+                        inUopCacheMode[tid] = false;
+                        if (uopCache->getSwitchDelay() > Cycles(0)) {
+                            uopCacheStallCycles[tid] = uopCache->getSwitchDelay();
+                        }
+                    }
+                    atPWBoundary[tid] = false;
+                }
+            }
+        }
+
         // Align the fetch PC so its at the start of a fetch buffer segment.
         Addr fetchBufferBlockPC = fetchBufferAlignPC(fetchAddr);
 
         // If buffer is no longer valid or fetchAddr has moved to point
         // to the next cache block, AND we have no remaining ucode
         // from a macro-op, then start fetch from icache.
-        if (!(fetchBufferValid[tid] && ftqReady(tid, status_change) &&
+        if (!uopCacheServing[tid] &&
+            !(fetchBufferValid[tid] && ftqReady(tid, status_change) &&
               fetchBufferBlockPC == fetchBufferPC[tid]) &&
             !inRom && !macroop[tid]) {
             DPRINTF(Fetch, "[tid:%i] Attempting to translate and read "
@@ -1195,6 +1250,69 @@ Fetch::fetch(bool &status_change)
     // predicted taken
     while (numInst < fetchWidth && fetchQueue[tid].size() < fetchQueueSize
            && !predictedBranch && !quiesce) {
+
+        if (uopCacheServing[tid]) {
+            while (activeUopIdx[tid] < activeUops[tid].size() &&
+                   numInst < fetchWidth &&
+                   fetchQueue[tid].size() < fetchQueueSize &&
+                   !predictedBranch && !quiesce) {
+                auto &uop = activeUops[tid][activeUopIdx[tid]];
+
+                if (uop.pc) {
+                    set(this_pc, *uop.pc);
+                }
+                if (uop.nextPC) {
+                    set(next_pc, *uop.nextPC);
+                } else {
+                    set(next_pc, this_pc);
+                }
+
+                DynInstPtr instruction = buildInst(
+                    tid, uop.staticInst, uop.macroop, this_pc, *next_pc, true);
+                ppFetch->notify(instruction);
+                numInst++;
+                uopCache->incUopHits(1);
+                instruction->fetchTick = curTick();
+
+                predictedBranch |= this_pc.branching();
+                predictedBranch |= bac->updatePC(instruction, *next_pc, curFT);
+                if (instruction->isControl()) {
+                    cpu->fetchStats[tid]->numBranches++;
+                }
+                if (predictedBranch) {
+                    DPRINTF(UopCache, "Branch detected in UopCache: PC=%s -> targ:%s\n",
+                            this_pc, *next_pc);
+                    ++fetchStats.predictedBranches;
+                }
+                set(this_pc, *next_pc);
+                activeUopIdx[tid]++;
+
+                if (instruction->isQuiesce()) {
+                    DPRINTF(Fetch,
+                            "Quiesce instruction encountered, halting fetch!\n");
+                    fetchStatus[tid] = QuiescePending;
+                    status_change = true;
+                    quiesce = true;
+                    break;
+                }
+
+                if (predictedBranch) {
+                    // Intermediate exit branch reached -> partial hit!
+                    if (activeUopIdx[tid] < activeUops[tid].size()) {
+                        uopCache->incPartialHits(1);
+                    }
+                    break;
+                }
+            }
+
+            if (activeUopIdx[tid] >= activeUops[tid].size() || predictedBranch) {
+                uopCacheServing[tid] = false;
+                activeUops[tid].clear();
+                activeUopIdx[tid] = 0;
+                atPWBoundary[tid] = true; // Finished serving PW: next PC is start of a new PW
+            }
+            break;
+        }
 
         // For the decoupled front-end also check if the FTQ
         // and the fetch target are still valid.
@@ -1276,6 +1394,12 @@ Fetch::fetch(bool &status_change)
             DynInstPtr instruction = buildInst(
                     tid, staticInst, curMacroop, this_pc, *next_pc, true);
 
+            if (uopCache && uopCache->isEnabled()) {
+                accumulationBuffer[tid].addUop(staticInst, curMacroop, this_pc, *next_pc,
+                                               inRom, fetchBufferPAddr[tid]);
+                uopCache->incUopMisses(1);
+            }
+
             ppFetch->notify(instruction);
             numInst++;
 
@@ -1300,6 +1424,23 @@ Fetch::fetch(bool &status_change)
             }
 
             newMacro |= this_pc.instAddr() != next_pc->instAddr();
+
+            // Paper: PW terminates ONLY at predicted-taken branch or cache line boundary
+            bool lineCrossed = (this_pc.instAddr() & ~Addr(cacheBlkSize - 1)) !=
+                               (next_pc->instAddr() & ~Addr(cacheBlkSize - 1));
+            bool pwEnded = predictedBranch || lineCrossed;
+
+            if (uopCache && uopCache->isEnabled() && pwEnded) {
+                if (accumulationBuffer[tid].hasPendingPW()) {
+                    PredictionWindow pw =
+                        accumulationBuffer[tid].finalizeWindow(next_pc->instAddr());
+                    if (!pw.containsRomUops) {
+                        pw.weight = uopCache->getWeightForAddress(pw.startPC);
+                        uopCache->insert(pw);
+                    }
+                }
+                atPWBoundary[tid] = true;
+            }
 
             // Move to the next instruction, unless we have a branch.
             set(this_pc, *next_pc);
@@ -1356,6 +1497,18 @@ Fetch::fetch(bool &status_change)
         // Re-evaluate whether the next instruction to fetch is in micro-op ROM
         // or not.
         inRom = isRomMicroPC(this_pc.microPC());
+    }
+
+    if (uopCache && uopCache->isEnabled() &&
+        (predictedBranch || blkOffset >= numInsts) &&
+        accumulationBuffer[tid].hasPendingPW()) {
+        PredictionWindow pw =
+            accumulationBuffer[tid].finalizeWindow(this_pc.instAddr());
+        if (!pw.containsRomUops) {
+            pw.weight = uopCache->getWeightForAddress(pw.startPC);
+            uopCache->insert(pw);
+        }
+        atPWBoundary[tid] = true;
     }
 
     if (predictedBranch) {
@@ -1670,6 +1823,22 @@ void
 Fetch::IcachePort::recvReqRetry()
 {
     fetch->recvReqRetry();
+}
+
+void
+Fetch::IcachePort::recvTimingSnoopReq(PacketPtr pkt)
+{
+    if (pkt->isInvalidate()) {
+        fetch->invalidateUopCache(pkt->getAddr());
+    }
+}
+
+void
+Fetch::invalidateUopCache(Addr addr)
+{
+    if (uopCache) {
+        uopCache->invalidateByIcacheAddr(addr, cacheBlkSize);
+    }
 }
 
 } // namespace o3

@@ -51,6 +51,7 @@
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/ftq.hh"
 #include "cpu/o3/limits.hh"
+#include "cpu/o3/uop_cache.hh"
 #include "cpu/pc_event.hh"
 #include "cpu/pred/bpred_unit.hh"
 #include "cpu/timebuf.hh"
@@ -103,6 +104,10 @@ class Fetch
 
         /** Handles doing a retry of a failed fetch. */
         virtual void recvReqRetry();
+
+        /** Invalidation snoop from icache for uop cache inclusiveness */
+        void recvTimingSnoopReq(PacketPtr pkt) override;
+        bool isSnooping() const override { return true; }
     };
 
     class FetchTranslation : public BaseMMU::Translation
@@ -271,6 +276,9 @@ class Fetch
 
     /** For priority-based fetch policies, need to keep update priorityList */
     void deactivateThread(ThreadID tid);
+
+    /** Invalidate entry in micro-op cache due to icache eviction (inclusiveness) */
+    void invalidateUopCache(Addr addr);
   private:
     /** Reset this pipeline stage */
     void resetStage();
@@ -545,6 +553,17 @@ class Fetch
     /*Max number of FT added to the FTQ per Cycle*/
     const unsigned maxFTPerCycle;
     const unsigned maxTakenPredPerCycle;
+
+    /** Micro-op Cache and frontend tracking structures */
+    std::unique_ptr<UopCache> uopCache;
+    AccumulationBuffer accumulationBuffer[MaxThreads];
+    bool uopCacheServing[MaxThreads];
+    bool inUopCacheMode[MaxThreads];
+    bool atPWBoundary[MaxThreads];
+    std::vector<CachedUop> activeUops[MaxThreads];
+    size_t activeUopIdx[MaxThreads];
+    Cycles uopCacheStallCycles[MaxThreads];
+    Addr fetchBufferPAddr[MaxThreads];
 
   protected:
     struct FetchStatGroup : public statistics::Group

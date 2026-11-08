@@ -1,0 +1,2 @@
+# Group_16_X7_reasearch_paper_implementaition_gem5
+We are implementing the research paper X7_From_Optimal_to_Practical_Efficient_Micro-op_Cache_Replacement_Policies_for_Data_Center_Applications using gem5 tool.

@@ -741,6 +741,7 @@ Fetch::doSquash(const PCStateBase &new_pc, const DynInstPtr squashInst,
     activeUopIdx[tid] = 0;
     accumulationBuffer[tid].reset();
     uopCacheStallCycles[tid] = Cycles(0);
+    fetchBufferValid[tid] = false;
 
     // Clear the icache miss if it's outstanding.
     if (fetchStatus[tid] == IcacheWaitResponse) {
@@ -1157,13 +1158,24 @@ Fetch::fetch(bool &status_change)
                     activeUopIdx[tid] = 0;
                     atPWBoundary[tid] = false;
                     decoder[tid]->reset();
+                    fetchBufferValid[tid] = false;
+                    fetchOffset[tid] = 0;
+                    pcOffset = 0;
+                    macroop[tid] = nullptr;
                 } else {
                     // Miss at PW boundary: charge 1-cycle penalty switch delay ONLY if
                     // transitioning from uop-cache mode back to legacy pipeline!
                     if (inUopCacheMode[tid]) {
                         inUopCacheMode[tid] = false;
+                        decoder[tid]->reset();
+                        fetchBufferValid[tid] = false;
+                        fetchOffset[tid] = 0;
+                        pcOffset = 0;
+                        macroop[tid] = nullptr;
                         if (uopCache->getSwitchDelay() > Cycles(0)) {
                             uopCacheStallCycles[tid] = uopCache->getSwitchDelay();
+                            atPWBoundary[tid] = false;
+                            return;
                         }
                     }
                     atPWBoundary[tid] = false;
@@ -1261,11 +1273,7 @@ Fetch::fetch(bool &status_change)
                 if (uop.pc) {
                     set(this_pc, *uop.pc);
                 }
-                if (uop.nextPC) {
-                    set(next_pc, *uop.nextPC);
-                } else {
-                    set(next_pc, this_pc);
-                }
+                set(next_pc, this_pc);
 
                 DynInstPtr instruction = buildInst(
                     tid, uop.staticInst, uop.macroop, this_pc, *next_pc, true);
@@ -1310,6 +1318,12 @@ Fetch::fetch(bool &status_change)
                 activeUops[tid].clear();
                 activeUopIdx[tid] = 0;
                 atPWBoundary[tid] = true; // Finished serving PW: next PC is start of a new PW
+                decoder[tid]->reset();
+                fetchBufferValid[tid] = false;
+                fetchOffset[tid] = 0;
+                pcOffset = 0;
+                macroop[tid] = nullptr;
+                curMacroop = nullptr;
             }
             break;
         }
@@ -1394,12 +1408,6 @@ Fetch::fetch(bool &status_change)
             DynInstPtr instruction = buildInst(
                     tid, staticInst, curMacroop, this_pc, *next_pc, true);
 
-            if (uopCache && uopCache->isEnabled()) {
-                accumulationBuffer[tid].addUop(staticInst, curMacroop, this_pc, *next_pc,
-                                               inRom, fetchBufferPAddr[tid]);
-                uopCache->incUopMisses(1);
-            }
-
             ppFetch->notify(instruction);
             numInst++;
 
@@ -1413,6 +1421,12 @@ Fetch::fetch(bool &status_change)
 
             // Get the next PC from the BAC stage.
             predictedBranch |= bac->updatePC(instruction, *next_pc, curFT);
+
+            if (uopCache && uopCache->isEnabled()) {
+                accumulationBuffer[tid].addUop(staticInst, curMacroop, this_pc, *next_pc,
+                                               inRom, fetchBufferPAddr[tid]);
+                uopCache->incUopMisses(1);
+            }
 
             if (instruction->isControl()) {
                 cpu->fetchStats[tid]->numBranches++;
@@ -1499,7 +1513,7 @@ Fetch::fetch(bool &status_change)
         inRom = isRomMicroPC(this_pc.microPC());
     }
 
-    if (uopCache && uopCache->isEnabled() &&
+    if (uopCache && uopCache->isEnabled() && !curMacroop &&
         (predictedBranch || blkOffset >= numInsts) &&
         accumulationBuffer[tid].hasPendingPW()) {
         PredictionWindow pw =
@@ -1545,6 +1559,7 @@ Fetch::fetch(bool &status_change)
     fetchAddr = (this_pc.instAddr() + pcOffset) & pc_mask;
     Addr fetchBufferBlockPC = fetchBufferAlignPC(fetchAddr);
     issuePipelinedIfetch[tid] =
+        !uopCacheServing[tid] && !inUopCacheMode[tid] &&
         fetchBufferBlockPC != fetchBufferPC[tid] &&
         fetchStatus[tid] != IcacheWaitResponse &&
         fetchStatus[tid] != ItlbWait && fetchStatus[tid] != FtqWait &&
@@ -1831,6 +1846,23 @@ Fetch::IcachePort::recvTimingSnoopReq(PacketPtr pkt)
     if (pkt->isInvalidate()) {
         fetch->invalidateUopCache(pkt->getAddr());
     }
+}
+
+void
+Fetch::IcachePort::recvFunctionalSnoop(PacketPtr pkt)
+{
+    if (pkt->isInvalidate()) {
+        fetch->invalidateUopCache(pkt->getAddr());
+    }
+}
+
+Tick
+Fetch::IcachePort::recvAtomicSnoop(PacketPtr pkt)
+{
+    if (pkt->isInvalidate()) {
+        fetch->invalidateUopCache(pkt->getAddr());
+    }
+    return 0;
 }
 
 void

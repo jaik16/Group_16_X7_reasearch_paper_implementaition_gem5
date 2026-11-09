@@ -63,11 +63,13 @@ struct CachedUop
         if (this != &other) {
             staticInst = other.staticInst;
             macroop = other.macroop;
-            pc = other.pc ? other.pc->clone() : nullptr;
-            nextPC = other.nextPC ? other.nextPC->clone() : nullptr;
+            pc.reset(other.pc ? other.pc->clone() : nullptr);
+            nextPC.reset(other.nextPC ? other.nextPC->clone() : nullptr);
         }
         return *this;
     }
+    CachedUop(CachedUop &&other) noexcept = default;
+    CachedUop& operator=(CachedUop &&other) noexcept = default;
 };
 
 /**
@@ -162,7 +164,7 @@ class AccumulationBuffer
 
   public:
     AccumulationBuffer(unsigned uops_per_entry = 8)
-        : accumulating(false), maxUopsPerEntry(uops_per_entry)
+        : accumulating(false), maxUopsPerEntry(uops_per_entry ? uops_per_entry : 8)
     {}
 
     void reset()

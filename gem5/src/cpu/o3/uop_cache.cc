@@ -78,6 +78,7 @@ UopCache::UopCache(CPU *_cpu, const BaseO3CPUParams &params)
       numEntries(params.uopCacheEntries),
       numWays(params.uopCacheAssoc),
       uopsPerEntry(params.uopCacheUopsPerEntry),
+      replPolicy(UopCacheReplPolicy::LRU),
       switchDelay(params.uopCacheSwitchDelay),
       decodeDelay(params.uopCacheDecodeDelay),
       inclusive(params.uopCacheInclusive),
@@ -436,7 +437,7 @@ UopCache::selectVictimLRU(unsigned setIdx)
 
     for (unsigned w = 0; w < numWays; ++w) {
         if (!set.entries[w].valid)
-            return w;
+            continue;
         if (set.entries[w].lastTouchTick < oldest) {
             oldest = set.entries[w].lastTouchTick;
             victim = w;
@@ -455,7 +456,7 @@ UopCache::peekVictimSRRIP(unsigned setIdx)
 
     for (unsigned w = 0; w < numWays; ++w) {
         if (!set.entries[w].valid)
-            return w;
+            continue;
         if (set.entries[w].rrpv >= maxRRPV) {
             maxRRPV = set.entries[w].rrpv;
             candidate = w;
@@ -469,17 +470,27 @@ UopCache::selectVictimSRRIP(unsigned setIdx)
 {
     auto &set = sets[setIdx];
 
+    bool hasValid = false;
+    for (unsigned w = 0; w < numWays; ++w) {
+        if (set.entries[w].valid) {
+            hasValid = true;
+            break;
+        }
+    }
+    if (!hasValid)
+        return 0;
+
     // Standard SRRIP: search for RRPV == 3; age entries until one reaches 3
     while (true) {
         for (unsigned w = 0; w < numWays; ++w) {
             if (!set.entries[w].valid)
-                return w;
+                continue;
             if (set.entries[w].rrpv >= 3) {
                 return w;
             }
         }
         for (unsigned w = 0; w < numWays; ++w) {
-            if (set.entries[w].rrpv < 3) {
+            if (set.entries[w].valid && set.entries[w].rrpv < 3) {
                 set.entries[w].rrpv++;
             }
         }
@@ -495,7 +506,7 @@ UopCache::selectVictimBelady(unsigned setIdx)
 
     for (unsigned w = 0; w < numWays; ++w) {
         if (!set.entries[w].valid)
-            return w;
+            continue;
         if (set.entries[w].nextAccess == UINT64_MAX) {
             return w; // No future access, prime victim
         }
@@ -517,8 +528,7 @@ UopCache::selectVictimFLACK(unsigned setIdx, const PredictionWindow &newPW, bool
 
     for (unsigned w = 0; w < numWays; ++w) {
         if (!set.entries[w].valid) {
-            bypass = false;
-            return w;
+            continue;
         }
         auto &entry = set.entries[w];
         double entryUnitCost = (double)entry.pwCost / (double)(entry.pwSize > 0 ? entry.pwSize : 1);
@@ -546,8 +556,7 @@ UopCache::selectVictimFURBYS(unsigned setIdx, const PredictionWindow &newPW, boo
 
     for (unsigned w = 0; w < numWays; ++w) {
         if (!set.entries[w].valid) {
-            bypass = false;
-            return w;
+            continue;
         }
 
         auto &entry = set.entries[w];

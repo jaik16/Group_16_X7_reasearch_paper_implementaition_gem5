@@ -107,6 +107,8 @@ class Fetch
 
         /** Invalidation snoop from icache for uop cache inclusiveness */
         void recvTimingSnoopReq(PacketPtr pkt) override;
+        void recvFunctionalSnoop(PacketPtr pkt) override;
+        Tick recvAtomicSnoop(PacketPtr pkt) override;
         bool isSnooping() const override { return true; }
     };
 

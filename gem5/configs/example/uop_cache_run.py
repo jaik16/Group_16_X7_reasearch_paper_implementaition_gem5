@@ -76,7 +76,7 @@ cpu.renameWidth = 6      # Table I: 6-wide OoO
 cpu.dispatchWidth = 6
 cpu.issueWidth = 6
 cpu.numROBEntries = 256  # Table I: 256-entry ROB
-cpu.numIQEntries = 96    # Table I: 96-entry RS
+cpu.instQueues = [IQUnit(numEntries=96)]  # Table I: 96-entry RS
 cpu.decoupledFrontEnd = False
 
 # Micro-op Cache Parameters
@@ -105,6 +105,8 @@ class L1ICache(Cache):
     response_latency = 1
     mshrs = 4
     tgts_per_mshr = 20
+    is_read_only = True
+    writeback_clean = True
 
 class L1DCache(Cache):
     size = "32KiB"

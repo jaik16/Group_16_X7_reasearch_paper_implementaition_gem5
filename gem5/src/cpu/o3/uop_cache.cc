@@ -320,33 +320,43 @@ UopCache::doInsert(const PredictionWindow &pw)
         }
     }
 
-    // 1. Evaluate Bypass Decision ONCE up front before evicting anything!
+    // 1. Count ways currently occupied by valid PWs in the set
+    unsigned waysUsed = 0;
+    for (unsigned w = 0; w < numWays; ++w) {
+        if (set.entries[w].valid) {
+            waysUsed += set.entries[w].pwSize;
+        }
+    }
+
+    // 2. Bypass is only considered when eviction would be required
     bool bypass = false;
-    if (replPolicy == UopCacheReplPolicy::FURBYS) {
-        uint8_t minWeight = 255;
-        bool hasValid = false;
-        for (unsigned w = 0; w < numWays; ++w) {
-            if (set.entries[w].valid) {
-                minWeight = std::min(minWeight, set.entries[w].weight);
-                hasValid = true;
+    if (waysUsed + neededWays > numWays) {
+        if (replPolicy == UopCacheReplPolicy::FURBYS) {
+            uint8_t minWeight = 255;
+            bool hasValid = false;
+            for (unsigned w = 0; w < numWays; ++w) {
+                if (set.entries[w].valid) {
+                    minWeight = std::min(minWeight, set.entries[w].weight);
+                    hasValid = true;
+                }
             }
-        }
-        if (hasValid && (int)pw.weight + furbysBypassThresholdK < (int)minWeight) {
-            bypass = true;
-        }
-    } else if (replPolicy == UopCacheReplPolicy::FLACK) {
-        double newUnitCost = (double)pw.cost / (double)neededWays;
-        double minUnitCost = 1e12;
-        bool hasValid = false;
-        for (unsigned w = 0; w < numWays; ++w) {
-            if (set.entries[w].valid) {
-                minUnitCost = std::min(minUnitCost,
-                    (double)set.entries[w].pwCost / (double)set.entries[w].pwSize);
-                hasValid = true;
+            if (hasValid && (int)pw.weight + furbysBypassThresholdK < (int)minWeight) {
+                bypass = true;
             }
-        }
-        if (hasValid && newUnitCost < minUnitCost) {
-            bypass = true;
+        } else if (replPolicy == UopCacheReplPolicy::FLACK) {
+            double newUnitCost = (double)pw.cost / (double)neededWays;
+            double minUnitCost = 1e12;
+            bool hasValid = false;
+            for (unsigned w = 0; w < numWays; ++w) {
+                if (set.entries[w].valid) {
+                    minUnitCost = std::min(minUnitCost,
+                        (double)set.entries[w].pwCost / (double)set.entries[w].pwSize);
+                    hasValid = true;
+                }
+            }
+            if (hasValid && newUnitCost < minUnitCost) {
+                bypass = true;
+            }
         }
     }
 
@@ -355,14 +365,6 @@ UopCache::doInsert(const PredictionWindow &pw)
         DPRINTF(UopCache, "UopCache BYPASS insertion for PC 0x%lx (weight %u)\n",
                 pw.startPC, pw.weight);
         return;
-    }
-
-    // 2. Count ways currently occupied by valid PWs in the set
-    unsigned waysUsed = 0;
-    for (unsigned w = 0; w < numWays; ++w) {
-        if (set.entries[w].valid) {
-            waysUsed += set.entries[w].pwSize;
-        }
     }
 
     // 3. Evict victim entries until waysUsed + neededWays <= numWays

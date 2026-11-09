@@ -1,0 +1,54 @@
+gem5 Simulator System.  https://www.gem5.org
+gem5 is copyrighted software; use the --copyright option for details.
+
+gem5 version 26.0.0.0
+gem5 compiled Nov  9 2026 05:34:01
+gem5 started Nov  9 2026 05:51:40
+gem5 executing on DESKTOP-FU9CUN3, pid 10833
+command line: ./build/X86/gem5.opt configs/example/uop_cache_run.py --help
+
+usage: uop_cache_run.py [-h] [--cmd CMD] [--options OPTIONS]
+                        [--enable-uop-cache] [--disable-uop-cache]
+                        [--uop-entries UOP_ENTRIES] [--uop-assoc UOP_ASSOC]
+                        [--uop-uops-per-entry UOP_UOPS_PER_ENTRY]
+                        [--repl-policy {lru,srrip,belady,flack,furbys}]
+                        [--uop-switch-delay UOP_SWITCH_DELAY]
+                        [--uop-decode-delay UOP_DECODE_DELAY]
+                        [--furbys-weight-file FURBYS_WEIGHT_FILE]
+                        [--uop-trace-file UOP_TRACE_FILE]
+                        [--furbys-k FURBYS_K] [--pitfall-depth PITFALL_DEPTH]
+                        [--dump-trace DUMP_TRACE]
+
+Evaluate Micro-op Cache in gem5 O3CPU
+
+options:
+  -h, --help            show this help message and exit
+  --cmd CMD             Path to executable binary (default: built-in hello)
+  --options OPTIONS     Command-line arguments for the binary
+  --enable-uop-cache    Enable the micro-op cache
+  --disable-uop-cache   Disable micro-op cache (baseline without uop cache)
+  --uop-entries UOP_ENTRIES
+                        Total entries in micro-op cache (default: 512)
+  --uop-assoc UOP_ASSOC
+                        Associativity of micro-op cache (default: 8)
+  --uop-uops-per-entry UOP_UOPS_PER_ENTRY
+                        Micro-ops per entry (default: 8)
+  --repl-policy {lru,srrip,belady,flack,furbys}
+                        Replacement policy: lru, srrip, belady, flack, furbys
+  --uop-switch-delay UOP_SWITCH_DELAY
+                        Switch penalty delay cycles on uop cache miss
+                        (default: 1)
+  --uop-decode-delay UOP_DECODE_DELAY
+                        Decoder pipeline latency cycles before PW insertion
+                        (default: 5)
+  --furbys-weight-file FURBYS_WEIGHT_FILE
+                        Path to offline-profiled weights file for FURBYS
+  --uop-trace-file UOP_TRACE_FILE
+                        Path to future access trace file for Belady or FLACK
+                        replay
+  --furbys-k FURBYS_K   Selective bypass threshold K for FURBYS (default: 1)
+  --pitfall-depth PITFALL_DEPTH
+                        Depth of local miss-pitfall detector (default: 2)
+  --dump-trace DUMP_TRACE
+                        File path to dump PW access trace for offline
+                        profiling

@@ -1760,7 +1760,7 @@
                 "uopCacheFurbysWeightFile": "",
                 "uopCacheInclusive": true,
                 "uopCachePitfallDepth": 2,
-                "uopCacheProfileOutputFile": "m5out_trace/pw_trace.txt",
+                "uopCacheProfileOutputFile": "hello_uop_trace.txt",
                 "uopCacheReplPolicy": "lru",
                 "uopCacheSwitchDelay": 1,
                 "uopCacheTraceFile": "",
@@ -1775,7 +1775,7 @@
                         "cmd": [
                             "tests/test-progs/hello/bin/x86/linux/hello"
                         ],
-                        "cwd": "/mnt/c/Users/JAYESH/Desktop/jayesh/textbooks/comp_arch/Group_16_X7_reasearch_paper_implementaition_gem5/gem5",
+                        "cwd": "/mnt/c/Users/JAYESH/desktop/jayesh/textbooks/comp_arch/Group_16_X7_reasearch_paper_implementaition_gem5/gem5",
                         "drivers": [],
                         "egid": 100,
                         "env": [],
